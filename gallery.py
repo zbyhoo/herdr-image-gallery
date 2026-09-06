@@ -13,6 +13,7 @@ import re
 import select
 import signal
 import sqlite3
+import socket
 import struct
 import subprocess
 import sys
@@ -220,7 +221,70 @@ def fit(width, height, columns, rows, cell_w=8, cell_h=16):
     return max(1, min(columns, int(width * scale / cell_w))), max(1, min(rows, int(height * scale / cell_h)))
 
 
-def transmit(encoded, width, height, columns, rows, image_id=IMAGE_ID):
+def graphics_api(method, **params):
+    request = {"id": "gallery", "method": "pane.graphics." + method,
+               "params": dict(params, pane_id=os.environ["HERDR_PANE_ID"])}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect(os.environ["HERDR_SOCKET_PATH"])
+        client.sendall((json.dumps(request) + "\n").encode())
+        with client.makefile("rb") as reader:
+            response = json.loads(reader.readline(1024 * 1024))
+    if "error" in response:
+        raise RuntimeError("Herdr graphics: " + str(response["error"]))
+    return response["result"]
+
+
+NATIVE_LAYERS = set()
+NATIVE_STREAMS = {}
+
+
+def native_frame(layer_id, data, **header):
+    if layer_id not in NATIVE_STREAMS:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5)
+        try:
+            client.connect(os.environ["HERDR_SOCKET_PATH"])
+            request = {"id": "gallery-stream", "method": "pane.graphics.stream",
+                       "params": {"pane_id": os.environ["HERDR_PANE_ID"], "layer_id": layer_id}}
+            client.sendall((json.dumps(request) + "\n").encode())
+            reader = client.makefile("rb")
+            response = json.loads(reader.readline(1024 * 1024))
+            if "error" in response:
+                raise RuntimeError(str(response["error"]))
+            NATIVE_STREAMS[layer_id] = (client, reader)
+        except Exception:
+            client.close()
+            raise
+    client, reader = NATIVE_STREAMS[layer_id]
+    try:
+        client.sendall((json.dumps(dict(header, data_length=len(data))) + "\n").encode() + data)
+        # Inline frames return only errors; success has no per-frame reply.
+        if select.select([client], [], [], 0.05)[0]:
+            response = json.loads(reader.readline(1024 * 1024))
+            if "error" in response:
+                raise RuntimeError(str(response["error"]))
+    except Exception:
+        NATIVE_STREAMS.pop(layer_id, None)
+        reader.close()
+        client.close()
+        raise
+
+
+
+def native_graphics():
+    return bool(os.environ.get("HERDR_PANE_ID"))
+
+
+def transmit(encoded, width, height, columns, rows, image_id=IMAGE_ID, col=0, row=0):
+    if native_graphics():
+        layer = "image-gallery-" + str(image_id)
+        # Register before sending so cleanup can recover a timed-out acknowledgement.
+        NATIVE_LAYERS.add(layer)
+        native_frame(layer, zlib.decompress(base64.b64decode(encoded)),
+                     format="rgb", image_width=width, image_height=height,
+                     placement={"viewport_col": col, "viewport_row": row, "grid_cols": columns, "grid_rows": rows})
+        return
     chunks = [encoded[i:i + 4096] for i in range(0, len(encoded), 4096)]
     for i, chunk in enumerate(chunks):
         header = ("a=T,f=24,o=z,s=%d,v=%d,t=d,i=%d,c=%d,r=%d,q=%d,C=1," % (width, height, image_id, columns, rows, 0 if image_id == IMAGE_ID else 2)) if i == 0 else ""
@@ -229,6 +293,15 @@ def transmit(encoded, width, height, columns, rows, image_id=IMAGE_ID):
 
 
 def delete_image():
+    if native_graphics():
+        for layer in tuple(NATIVE_LAYERS):
+            stream = NATIVE_STREAMS.pop(layer, None)
+            if stream:
+                stream[1].close()
+                stream[0].close()
+            else:
+                graphics_api("clear", layer_id=layer)
+            NATIVE_LAYERS.remove(layer)
     for image_id in range(IMAGE_ID, IMAGE_ID + 25):
         sys.stdout.write("\x1b_Ga=d,d=I,i=%d,q=2;\x1b\\" % image_id)
 
@@ -240,7 +313,7 @@ def terminal_size():
 
 def grid_geometry(cols, rows, count, selected):
     columns = min(4, max(1, (cols - 2) // 28))
-    grid_rows = min(6, max(1, (rows - 7) // 9))
+    grid_rows = min(4, max(1, (rows - 7) // 9))
     page_size = columns * grid_rows
     start = selected // page_size * page_size
     return columns, grid_rows, page_size, start
@@ -288,8 +361,10 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
                 ic, ir = fit(width, height, max(1, cell_cols - 2), max(1, cell_rows - 2), cw, ch)
                 sys.stdout.write("\x1b[%d;%dH" % (y + 1 + max(0, (cell_rows - 2 - ir) // 2), x + max(0, (cell_cols - ic) // 2)))
                 sys.stdout.flush()
-                transmit(data, width, height, ic, ir, IMAGE_ID + 1 + slot)
-            except (OSError, ValueError, subprocess.SubprocessError):
+                transmit(data, width, height, ic, ir, IMAGE_ID + 1 + slot,
+                         col=x + max(0, (cell_cols - ic) // 2) - 1,
+                         row=y + max(0, (cell_rows - 2 - ir) // 2))
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                 sys.stdout.write("\x1b[%d;%dH\x1b[31mMissing image\x1b[0m" % (y + 2, x))
         line(rows - 1, item["title"], "36")
         line(rows, "/ " + query if searching else "Arrows: select  Enter/click: open  Tab: switch view  PgUp/PgDn: pages", "90")
@@ -307,15 +382,74 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
         ic, ir = fit(width, height, cols - 2, max(1, rows - 9), cw, ch)
         sys.stdout.write("\x1b[%d;%dH" % (5 + max(0, (rows - 9 - ir) // 2), 1 + (cols - ic) // 2))
         sys.stdout.flush()
-        transmit(data, width, height, ic, ir)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        transmit(data, width, height, ic, ir, col=(cols - ic) // 2,
+                 row=4 + max(0, (rows - 9 - ir) // 2))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         error = str(exc)
         line(6, "Cannot display: " + error, "31")
     line(rows - 3, item["caption"], "37")
     line(rows - 2, item["path"], "90")
-    line(rows, "/ " + query if searching else "New Codex images appear automatically in LIVE mode.", "36")
+    line(rows, "/ " + query if searching else "LIVE: new Codex images appear automatically.  s: Codex setup", "36")
     sys.stdout.flush()
     return error
+
+
+def codex_skill_paths():
+    source = Path(__file__).resolve().parent / "skills" / "herdr-image-gallery"
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    return source, home / "skills" / "herdr-image-gallery"
+
+
+def codex_skill_status():
+    source, target = codex_skill_paths()
+    if target.is_symlink() and target.resolve() == source.resolve():
+        return "installed"
+    return "conflict" if target.exists() or target.is_symlink() else "missing"
+
+
+def install_codex_skill():
+    source, target = codex_skill_paths()
+    if not (source / "SKILL.md").is_file():
+        raise RuntimeError("Bundled Codex skill is missing; reinstall this plugin.")
+    status = codex_skill_status()
+    if status == "conflict":
+        raise RuntimeError("Existing skill preserved: " + str(target))
+    if status != "installed":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source, target_is_directory=True)
+    return "Codex skill installed. Restart Codex to load it."
+
+
+def setup_key(key):
+    # Explicit consent only. Enter and Escape decline; terminal replies are ignored upstream.
+    if key.lower() == "y":
+        try:
+            return False, install_codex_skill()
+        except (OSError, RuntimeError) as exc:
+            return False, str(exc)
+    if key.lower() == "n" or key in ("\r", "\n", "\x1b"):
+        return False, "Skipped. Press s to set up Codex later."
+    return True, ""
+
+
+class ResizeRefresh:
+    """Replay cached graphics after the host finishes rebuilding its layout."""
+    def __init__(self):
+        self.size = None
+        self.deadlines = []
+
+    def notify(self, *_):
+        now = time.monotonic()
+        self.deadlines = [now + 0.35, now + 1.0]
+
+    def due(self, size):
+        if self.size is not None and size != self.size:
+            self.notify()
+        self.size = size
+        now = time.monotonic()
+        ready = bool(self.deadlines and now >= self.deadlines[0])
+        self.deadlines = [deadline for deadline in self.deadlines if deadline > now]
+        return ready
 
 
 def gallery(db):
@@ -331,6 +465,8 @@ def gallery(db):
     paused = resume.get("paused", False)
     mode = resume.get("mode", "preview")
     cache, previous, heartbeat = {}, None, 0
+    setup = codex_skill_status() != "installed" and not get(db, "codex_setup_dismissed")
+    setup_message = ""
     running = True
     pending = deque()
     source_revision = Path(__file__).stat().st_mtime_ns
@@ -340,6 +476,8 @@ def gallery(db):
         nonlocal running
         running = False
 
+    resize_refresh = ResizeRefresh()
+    old_winch = signal.signal(signal.SIGWINCH, resize_refresh.notify)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
@@ -362,12 +500,24 @@ def gallery(db):
             index = next((i for i, r in enumerate(items) if r["path"] == selected), 0)
             if items:
                 selected = items[index]["path"]
-            state = ([(r["path"], r["updated"]) for r in items], index, query, searching, paused, terminal_size(), last_request, mode)
+            state = ([(r["path"], r["updated"]) for r in items], index, query, searching, paused, terminal_size(), last_request, mode, setup, setup_message)
+            if resize_refresh.due(state[5]):
+                # Grid selection caching must not suppress host-surface restoration.
+                cache.pop("grid_signature", None)
+                previous = None
             if state != previous:
                 error = draw(items, index, query, searching, paused, cache, mode)
                 put(db, displayed_path=selected, rendered_request=last_request, error=error,
                     preview_metrics=cache.get("metrics", ""),
                     view_state=json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused, "mode": mode}))
+                if native_graphics():
+                    put(db, terminal_reply="OK" if not error else error, terminal_request=last_request,
+                        acknowledgement="herdr-stream-submitted")
+                if setup or setup_message:
+                    message = "Enable bundled Codex skill? y: install / Enter, Esc, n: later" if setup else setup_message
+                    cols, rows = terminal_size()[:2]
+                    sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[36m%s\x1b[0m" % (rows, clean(message)[:cols - 1]))
+                    sys.stdout.flush()
                 previous = state
             if not pending:
                 ready, _, _ = select.select([fd], [], [], 0.2)
@@ -391,6 +541,13 @@ def gallery(db):
                 continue
             if key == "\x03":
                 break
+            if setup and key == "q":
+                break
+            if setup:
+                setup, setup_message = setup_key(key)
+                if not setup:
+                    put(db, codex_setup_dismissed="1")
+                continue
             mouse = re.fullmatch(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])", key)
             if mouse:
                 button, x, y = map(int, mouse.groups()[:3])
@@ -416,7 +573,12 @@ def gallery(db):
                 continue
             if key == "q":
                 break
-            if key in ("\t", "g"):
+            if key == "s":
+                if codex_skill_status() == "installed":
+                    setup_message = "Codex skill is installed. Restart Codex if it has not loaded it."
+                else:
+                    setup, setup_message = True, ""
+            elif key in ("\t", "g"):
                 mode = "preview" if mode == "grid" else "grid"
             elif key in ("\r", "\n") and mode == "grid":
                 mode = "preview"
@@ -442,6 +604,7 @@ def gallery(db):
                         step = page_size if key == "\x1b[6~" else -page_size
                 selected = items[(index + step) % len(items)]["path"]
     finally:
+        signal.signal(signal.SIGWINCH, old_winch)
         put(db, heartbeat=0)
         delete_image()
         sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l")
@@ -455,14 +618,25 @@ def gallery(db):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="view", choices=["view", "show", "open", "list", "status", "link"])
+    parser.add_argument("command", nargs="?", default="view", choices=["view", "show", "open", "list", "status", "link", "setup-codex"])
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--title", default="")
     parser.add_argument("--caption", default="")
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--open", action="store_true", dest="open_action")
+    parser.add_argument("--yes", action="store_true", help="Consent to install the bundled Codex skill (setup-codex only)")
     parser.add_argument("--wait", type=float, default=0)
     args = parser.parse_args()
+    if args.command == "setup-codex":
+        if not args.yes:
+            if not sys.stdin.isatty():
+                parser.error("setup-codex requires interactive consent or --yes")
+            print("Register bundled skill at %s?" % codex_skill_paths()[1])
+            if input("Install? [y/N] ").strip().lower() != "y":
+                print("Skipped; no files changed.")
+                return 0
+        print(install_codex_skill())
+        return 0
     if args.command == "link":
         context = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
         url = os.environ.get("HERDR_PLUGIN_CLICKED_URL") or context.get("clicked_url", "")
@@ -487,7 +661,8 @@ def main():
                 time.sleep(0.1)
             rendered = get(db, "terminal_request") == token and get(db, "terminal_reply") == "OK"
             error = get(db, "error") if get(db, "rendered_request") == token else ""
-            print(json.dumps({"request": token, "path": str(paths[-1]), "rendered": rendered and not error,
+            print(json.dumps({"request": token, "path": str(paths[-1]), "rendered": None if get(db, "acknowledgement") == "herdr-stream-submitted" else rendered and not error,
+                              "delivered": rendered and not error, "acknowledgement": get(db, "acknowledgement", "kitty-terminal"),
                               "error": error, "workspace": os.environ["HERDR_WORKSPACE_ID"]}))
             if args.wait and (not rendered or get(db, "error")):
                 return 2

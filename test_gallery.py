@@ -24,10 +24,11 @@ class GalleryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.env = patch.dict(os.environ, {"HERDR_GALLERY_STATE_DIR": self.temp.name,
-                             "HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w1",
+                             "HERDR_PANE_ID": "", "CODEX_HOME": str(Path(self.temp.name) / "codex"), "HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w1",
                              "HERDR_SOCKET_PATH": "/tmp/test-herdr.sock"})
         self.env.start()
         self.db = gallery.connect()
+        gallery.put(self.db, codex_setup_dismissed="1")
         self.path = Path(self.temp.name) / "image with spaces.png"
         self.path.write_bytes(b"test fixture")
 
@@ -35,6 +36,79 @@ class GalleryTests(unittest.TestCase):
         self.db.close()
         self.env.stop()
         self.temp.cleanup()
+
+    def test_native_layer_uses_pane_coordinates_and_owned_cleanup(self):
+        encoded = base64.b64encode(zlib.compress(b"\xff\0\0"))
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}), patch.object(gallery, "native_frame") as api, patch.object(gallery, "graphics_api") as clear:
+            gallery.transmit(encoded, 1, 1, 10, 5, col=8, row=4)
+            args = api.call_args.kwargs
+            self.assertEqual(args["placement"], {"viewport_col": 8, "viewport_row": 4, "grid_cols": 10, "grid_rows": 5})
+            self.assertEqual(api.call_args.args[1], b"\xff\0\0")
+            with patch("sys.stdout", new=io.StringIO()):
+                gallery.delete_image()
+            self.assertEqual(clear.call_args.args, ("clear",))
+            self.assertEqual(clear.call_args.kwargs, {"layer_id": "image-gallery-71031"})
+            self.assertFalse(gallery.NATIVE_LAYERS)
+
+    def test_resize_refresh_debounces_and_stops_after_two_replays(self):
+        refresh = gallery.ResizeRefresh()
+        with patch.object(gallery.time, "monotonic", return_value=10) as clock:
+            self.assertFalse(refresh.due((99, 28)))
+            self.assertFalse(refresh.due((80, 28)))
+            clock.return_value = 10.2
+            self.assertFalse(refresh.due((79, 28)))
+            clock.return_value = 10.4
+            self.assertFalse(refresh.due((79, 28)))
+            clock.return_value = 10.6
+            self.assertTrue(refresh.due((79, 28)))
+            self.assertFalse(refresh.due((79, 28)))
+            clock.return_value = 11.3
+            self.assertTrue(refresh.due((79, 28)))
+            clock.return_value = 20
+            self.assertFalse(refresh.due((79, 28)))
+            refresh.notify()  # SIGWINCH can arrive even with unchanged final dimensions.
+            clock.return_value = 21.1
+            self.assertTrue(refresh.due((79, 28)))
+            self.assertFalse(refresh.due((79, 28)))
+
+    def test_setup_declining_does_not_create_skill(self):
+        for key in ("n", "\r", "\x1b", "N"):
+            self.assertFalse(gallery.setup_key(key)[0])
+            self.assertFalse(gallery.codex_skill_paths()[1].exists())
+        self.assertTrue(gallery.setup_key("x")[0])
+
+    def test_setup_explicit_consent_installs_idempotently(self):
+        pending, message = gallery.setup_key("y")
+        self.assertFalse(pending)
+        self.assertIn("Restart Codex", message)
+        source, target = gallery.codex_skill_paths()
+        self.assertEqual(target.resolve(), source.resolve())
+        self.assertTrue(target.is_symlink())
+        gallery.install_codex_skill()
+        self.assertEqual(gallery.codex_skill_status(), "installed")
+
+    def test_setup_preserves_existing_directory_and_broken_link(self):
+        source, target = gallery.codex_skill_paths()
+        target.mkdir(parents=True)
+        marker = target / "user-file"
+        marker.write_text("keep")
+        self.assertIn("preserved", gallery.setup_key("y")[1])
+        self.assertEqual(marker.read_text(), "keep")
+        marker.unlink()
+        target.rmdir()
+        target.symlink_to(target.parent / "missing")
+        self.assertIn("preserved", gallery.setup_key("y")[1])
+        self.assertTrue(target.is_symlink())
+
+    def test_setup_cli_requires_consent_without_tty(self):
+        result = subprocess.run([sys.executable, gallery.__file__, "setup-codex"],
+                                input="", text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(gallery.codex_skill_paths()[1].exists())
+        result = subprocess.run([sys.executable, gallery.__file__, "setup-codex", "--yes"],
+                                input="", text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(gallery.codex_skill_status(), "installed")
 
     def test_separate_reader_receives_repeated_show_without_duplicate_history(self):
         first = gallery.publish(self.db, self.path, "First")
@@ -169,11 +243,13 @@ class GalleryTests(unittest.TestCase):
         def start():
             return subprocess.Popen([sys.executable, str(Path(gallery.__file__))], stdin=slave, stdout=slave, stderr=slave, env=env)
 
+        output = bytearray()
+
         def wait_for(proc, predicate):
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 if select.select([master], [], [], 0.02)[0]:
-                    os.read(master, 65536)
+                    output.extend(os.read(master, 65536))
                 if predicate():
                     return
                 if proc.poll() is not None:
@@ -183,9 +259,20 @@ class GalleryTests(unittest.TestCase):
         def state():
             return json.loads(gallery.get(self.db, "view_state", "{}"))
 
+        gallery.put(self.db, codex_setup_dismissed="")
         proc = start()
         try:
             wait_for(proc, lambda: state().get("path") == str(other.resolve()))
+            os.write(master, b"\x1b")
+            wait_for(proc, lambda: gallery.get(self.db, "codex_setup_dismissed") == "1")
+            self.assertFalse(gallery.codex_skill_paths()[1].exists())
+            self.assertIsNone(proc.poll())
+            os.write(master, b"sy")
+            wait_for(proc, lambda: gallery.codex_skill_status() == "installed")
+            before = output.count(b"a=T,f=24")
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 85, 680, 448))
+            wait_for(proc, lambda: output.count(b"a=T,f=24") >= before + 3)
+            self.assertEqual(state().get("path"), str(other.resolve()))
             os.write(master, b"\t")
             wait_for(proc, lambda: state().get("mode") == "grid")
             os.write(master, b"\x1b[C\r")

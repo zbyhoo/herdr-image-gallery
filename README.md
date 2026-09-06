@@ -9,7 +9,7 @@ A native [Herdr](https://herdr.dev) plugin for viewing generated images and loca
 - Direct publication from Codex through a companion skill.
 - Ctrl-click handlers for local image hyperlinks.
 - Persistent history, archived image copies, and restored selection/view.
-- Compressed, cached previews. Moving the thumbnail selection does not resend images.
+- Cached previews and native Herdr graphics layers that follow pane layout changes. Moving the thumbnail selection does not resend images.
 - User-owned layout: updates never reposition an existing pane.
 
 ## Requirements
@@ -62,6 +62,7 @@ The stable plugin ID is `local.image-gallery`, regardless of the installation so
 | Esc | End filter editing or return to thumbnails; never closes the gallery |
 | a | Toggle LIVE / HOLD |
 | f | Toggle fullscreen for the current pane |
+| s | Set up the bundled Codex skill |
 | q | Close the gallery; history is retained |
 
 Reopen at any time with:
@@ -81,7 +82,7 @@ python3 /path/to/herdr-image-gallery/gallery.py show /absolute/image.png \
   --title 'Concept' --caption 'Art direction' --wait 10
 ```
 
-`show` reuses the existing gallery without changing keyboard focus. It opens a pane only if the gallery is closed. `--no-open` queues the image without opening one. `--wait` exits nonzero if the pane does not acknowledge rendering or decoding fails.
+`show` reuses the existing gallery without changing keyboard focus. It opens a pane only if the gallery is closed. `--no-open` queues the image without opening one. `--wait` exits nonzero if delivery is not confirmed or decoding fails. Native Herdr layers report `delivered: true` and `rendered: null`: inline streams do not acknowledge host pixels.
 
 Other commands: `open`, `list`, and `status`.
 
@@ -89,16 +90,13 @@ LIVE follows explicit messages from the agent, not unrelated filesystem activity
 
 ## Codex integration
 
-Install the companion skill from your local checkout:
+The skill is bundled: no separate download is needed. On first opening, the gallery asks whether to register it with Codex. Press **y** to install, or **Enter / Esc / n** to skip. Press **s** in the gallery to revisit setup at any time. Skipping is remembered for this workspace.
 
-```sh
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-ln -s "$PWD/skills/herdr-image-gallery" "${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery"
-```
+Registration creates a symlink under `${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery` pointing into the installed plugin, including a GitHub-managed installation. Existing unrelated files or links are preserved and reported as a conflict; inspect and remove an obsolete link yourself before retrying. Run setup with the same `CODEX_HOME` as your Codex session.
 
-If that destination already exists, inspect it instead of overwriting it. For a GitHub-managed installation, locate the installed plugin root with `herdr plugin list --json` and link its `skills/herdr-image-gallery` directory.
+Restart Codex after registration so it discovers the skill. The skill instructs Codex to publish final imagegen results and accessible local attachments. It does not intercept imagegen: Codex must load and follow the skill. The gallery also works without Codex through the CLI and local hyperlinks.
 
-New Codex conversations can discover the skill. In an existing conversation, ask Codex to read `$herdr-image-gallery`. The skill tells the agent to send final imagegen results and locally accessible attachments as they become available. It does not intercept imagegen or watch every file automatically.
+For setup outside the viewer, run `python3 /path/to/herdr-image-gallery/gallery.py setup-codex`. This asks for consent; `--yes` explicitly consents for scripted installation. Uninstalling the plugin does not delete gallery history; remove its skill symlink separately if no longer needed.
 
 A portable helper is also available through the installed skill:
 
@@ -119,6 +117,9 @@ History is stored under `~/.local/state/herdr-image-gallery/`, isolated by Herdr
 Reopening in the same workspace restores history, selection, filter and LIVE/HOLD state. A different socket or workspace identity has separate history. No network listener or upload is used. `HERDR_GALLERY_STATE_DIR` overrides storage for isolated tests.
 
 PNG, JPEG, WebP, GIF, TIFF, BMP and HEIC are decoded by the macOS system codec. Animated formats display a static frame. Source files are not modified. Previews have a longest edge of at most 960 pixels and a 32-frame cache; final display latency also depends on Herdr and the outer terminal.
+
+
+Known Herdr 0.8.2 limitation: images are hidden while PREFIX mode is active and return after leaving it (for example with Esc). The host renderer restricts graphics to terminal mode; fixing this requires a Herdr change. The plugin's resize refresh does not fix PREFIX-mode visibility.
 
 ## Development
 

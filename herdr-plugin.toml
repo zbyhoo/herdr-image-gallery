@@ -1,0 +1,36 @@
+id = "local.image-gallery"
+name = "Image Gallery"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Browse project and generated images inside a Herdr terminal pane"
+platforms = ["macos"]
+
+[[panes]]
+id = "gallery"
+title = "Image Gallery"
+placement = "split"
+command = ["/usr/bin/python3", "gallery.py"]
+
+[[actions]]
+id = "open"
+title = "Open Image Gallery"
+contexts = ["workspace"]
+command = ["/usr/bin/python3", "gallery.py", "--open"]
+
+[[actions]]
+id = "show-link"
+title = "Show linked image in gallery"
+contexts = ["workspace"]
+command = ["/usr/bin/python3", "gallery.py", "link"]
+
+[[link_handlers]]
+id = "local-image"
+title = "Open local image in gallery"
+pattern = '^file://.*\.(?i:png|jpe?g|webp|gif|tiff?|bmp|heic)(?:[?#].*)?$'
+action = "show-link"
+
+[[link_handlers]]
+id = "gallery-image"
+title = "Open image in gallery"
+pattern = '^herdr-image://open\?path='
+action = "show-link"

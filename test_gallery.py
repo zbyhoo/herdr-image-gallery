@@ -37,6 +37,43 @@ class GalleryTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
+    def test_preview_replacement_prepares_before_touching_previous_layer(self):
+        gallery.publish(self.db, self.path)
+        items = self.db.execute("SELECT * FROM images").fetchall()
+        events = []
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}), \
+             patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch.object(gallery, "prepare_preview", side_effect=lambda *a: events.append("ready") or (b"pixels", 100, 60)), \
+             patch.object(gallery, "transmit", side_effect=lambda *a, **kw: events.append("replace")), \
+             patch.object(gallery, "delete_image", side_effect=lambda **kw: events.append(("cleanup", kw))), \
+             patch("sys.stdout", new=io.StringIO()):
+            gallery.draw(items, 0, "", False, False, {})
+        self.assertEqual(events, ["ready", "replace", ("cleanup", {"keep": ("image-gallery-71031",)})])
+
+    def test_failed_load_preserves_current_layer(self):
+        gallery.publish(self.db, self.path)
+        items = self.db.execute("SELECT * FROM images").fetchall()
+        with patch.object(gallery, "NATIVE_LAYERS", {"image-gallery-71031", "image-gallery-loading"}), \
+             patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch.object(gallery, "prepare_preview", side_effect=ValueError("bad image")), \
+             patch.object(gallery, "transmit") as send, patch.object(gallery, "delete_image") as clear, \
+             patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(gallery.draw(items, 0, "", False, False, {}), "bad image")
+            send.assert_not_called()
+            clear.assert_called_once_with(keep=("image-gallery-71031",))
+
+    def test_slow_decode_shows_loader_but_cache_hit_does_not(self):
+        item = {"path": str(self.path), "cached_path": str(self.path)}
+        def slow(*args):
+            time.sleep(0.23)
+            return b"pixels", 1, 1
+        with patch.object(gallery, "preview", side_effect=slow), patch.object(gallery, "loading_indicator") as spinner:
+            self.assertEqual(gallery.prepare_preview(item, 99, 28, 8, 16), (b"pixels", 1, 1))
+            self.assertGreater(spinner.call_count, 0)
+        with patch.object(gallery, "preview", return_value=(b"pixels", 1, 1)), patch.object(gallery, "loading_indicator") as spinner:
+            gallery.prepare_preview(item, 99, 28, 8, 16)
+            spinner.assert_not_called()
+
     def test_native_layer_uses_pane_coordinates_and_owned_cleanup(self):
         encoded = base64.b64encode(zlib.compress(b"\xff\0\0"))
         with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2"}), patch.object(gallery, "native_frame") as api, patch.object(gallery, "graphics_api") as clear:

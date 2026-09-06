@@ -10,6 +10,7 @@ A native [Herdr](https://herdr.dev) plugin for viewing generated images and loca
 - Ctrl-click handlers for local image hyperlinks.
 - Persistent history, archived image copies, and restored selection/view.
 - Cached previews and native Herdr graphics layers that follow pane layout changes. Moving the thumbnail selection does not resend images.
+- Preview switching keeps the previous image until decoding completes; a centered spinner appears after 180 ms. Decode failures preserve the previous image.
 - User-owned layout: updates never reposition an existing pane.
 
 ## Requirements

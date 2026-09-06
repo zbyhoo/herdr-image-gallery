@@ -14,6 +14,8 @@ import select
 import signal
 import sqlite3
 import socket
+import math
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import struct
 import subprocess
 import sys
@@ -292,9 +294,11 @@ def transmit(encoded, width, height, columns, rows, image_id=IMAGE_ID, col=0, ro
     sys.stdout.buffer.flush()
 
 
-def delete_image():
+def delete_image(keep=()):
     if native_graphics():
         for layer in tuple(NATIVE_LAYERS):
+            if layer in keep:
+                continue
             stream = NATIVE_STREAMS.pop(layer, None)
             if stream:
                 stream[1].close()
@@ -306,6 +310,43 @@ def delete_image():
         sys.stdout.write("\x1b_Ga=d,d=I,i=%d,q=2;\x1b\\" % image_id)
 
 
+def loading_indicator(cols, rows, tick):
+    if not native_graphics():
+        sys.stdout.write("\x1b[%d;%dHLoading %s" % (rows // 2, max(1, cols // 2 - 5), "|/-\\"[tick % 4]))
+        sys.stdout.flush()
+        return
+    # A transparent graphic overlay stays visible above the retained image.
+    size = 48
+    pixels = bytearray(size * size * 4)
+    for y in range(size):
+        for x in range(size):
+            dx, dy = x - 23.5, y - 23.5
+            if 14 <= math.hypot(dx, dy) <= 20:
+                angle = (math.atan2(dy, dx) - tick * 0.5) % (2 * math.pi)
+                alpha = int(55 + 200 * (1 - angle / (2 * math.pi)))
+                offset = (y * size + x) * 4
+                pixels[offset:offset + 4] = bytes((125, 225, 215, alpha))
+    layer = "image-gallery-loading"
+    NATIVE_LAYERS.add(layer)
+    native_frame(layer, bytes(pixels), format="rgba", image_width=size, image_height=size,
+                 placement={"viewport_col": max(0, cols // 2 - 2), "viewport_row": max(0, rows // 2 - 1),
+                            "grid_cols": 4, "grid_rows": 2})
+
+
+def prepare_preview(item, cols, rows, cw, ch):
+    path = display_path(item)
+    args = (str(path), path.stat().st_mtime_ns, max(1, round((cols - 2) * cw)), max(1, round((rows - 9) * ch)))
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        future = worker.submit(preview, *args)
+        tick = 0
+        while True:
+            try:
+                return future.result(timeout=0.18 if tick == 0 else 0.1)
+            except FutureTimeout:
+                loading_indicator(cols, rows, tick)
+                tick += 1
+
+
 def terminal_size():
     rows, cols, pxw, pxh = struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
     return max(cols, 10), max(rows, 10), pxw / cols if pxw and cols else 8, pxh / rows if pxh and rows else 16
@@ -313,7 +354,7 @@ def terminal_size():
 
 def grid_geometry(cols, rows, count, selected):
     columns = min(4, max(1, (cols - 2) // 28))
-    grid_rows = min(4, max(1, (rows - 7) // 9))
+    grid_rows = min(15 // columns, 4, max(1, (rows - 7) // 9))
     page_size = columns * grid_rows
     start = selected // page_size * page_size
     return columns, grid_rows, page_size, start
@@ -321,13 +362,24 @@ def grid_geometry(cols, rows, count, selected):
 
 def draw(items, index, query, searching, paused, cache, mode="preview"):
     cols, rows, cw, ch = terminal_size()
+    prepared = None
+    if mode == "preview" and items:
+        started = time.monotonic()
+        try:
+            prepared = prepare_preview(items[index], cols, rows, cw, ch)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            delete_image(keep=tuple(layer for layer in NATIVE_LAYERS if layer != "image-gallery-loading"))
+            sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[31m%s\x1b[0m" % (rows, clean("Cannot load: " + str(exc))[:cols - 1]))
+            sys.stdout.flush()
+            return str(exc)
     signature = None
     if mode == "grid" and items:
         columns, grid_rows, page_size, start = grid_geometry(cols, rows, len(items), index)
         signature = (cols, rows, cw, ch, start, tuple((r["path"], r["updated"]) for r in items[start:start + page_size]))
     reuse_grid = signature is not None and signature == cache.get("grid_signature")
     if not reuse_grid:
-        delete_image()
+        if not (native_graphics() and prepared is not None):
+            delete_image()
         sys.stdout.write("\x1b[2J\x1b[H")
     cache["grid_signature"] = signature
 
@@ -374,9 +426,7 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
     error = ""
     try:
         path = display_path(item)
-        started = time.monotonic()
-        data, width, height = preview(str(path), path.stat().st_mtime_ns,
-                                     max(1, round((cols - 2) * cw)), max(1, round((rows - 9) * ch)))
+        data, width, height = prepared
         cache["metrics"] = json.dumps({"preview_ms": round((time.monotonic() - started) * 1000, 1),
                                        "bytes": len(data), "width": width, "height": height})
         ic, ir = fit(width, height, cols - 2, max(1, rows - 9), cw, ch)
@@ -384,8 +434,12 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
         sys.stdout.flush()
         transmit(data, width, height, ic, ir, col=(cols - ic) // 2,
                  row=4 + max(0, (rows - 9 - ir) // 2))
+        if native_graphics():
+            delete_image(keep=("image-gallery-" + str(IMAGE_ID),))
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         error = str(exc)
+        if native_graphics():
+            delete_image(keep=tuple(layer for layer in NATIVE_LAYERS if layer != "image-gallery-loading"))
         line(6, "Cannot display: " + error, "31")
     line(rows - 3, item["caption"], "37")
     line(rows - 2, item["path"], "90")

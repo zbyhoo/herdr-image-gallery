@@ -360,6 +360,19 @@ def grid_geometry(cols, rows, count, selected):
     return columns, grid_rows, page_size, start
 
 
+def workspace_label(fallback=None):
+    workspace = os.environ["HERDR_WORKSPACE_ID"]
+    try:
+        result = herdr("workspace", "get", workspace)
+        return clean(result["result"]["workspace"].get("label") or workspace)
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError):
+        return fallback or workspace
+
+
+def gallery_heading(label, paused):
+    return "IMAGE GALLERY  |  " + label + "  |  " + ("HOLD" if paused else "LIVE")
+
+
 def draw(items, index, query, searching, paused, cache, mode="preview"):
     cols, rows, cw, ch = terminal_size()
     prepared = None
@@ -386,7 +399,7 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
     def line(row, text, color="37"):
         sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[%sm%s\x1b[0m" % (row, color, clean(text)[:cols - 1]))
 
-    line(1, "IMAGE GALLERY  |  " + os.environ["HERDR_WORKSPACE_ID"] + "  |  " + ("HOLD" if paused else "LIVE"), "1;36")
+    line(1, gallery_heading(cache.get("workspace_label", os.environ["HERDR_WORKSPACE_ID"]), paused), "1;36")
     line(2, "Tab: thumbnails  arrows: select  Enter: open  /: filter  a: live/hold  f: zoom  q: close", "90")
     if not items:
         line(4, "Waiting for Codex to send an image." if not query else "No matching images.")
@@ -521,6 +534,7 @@ def gallery(db):
     cache, previous, heartbeat = {}, None, 0
     setup = codex_skill_status() != "installed" and not get(db, "codex_setup_dismissed")
     setup_message = ""
+    label_checked = 0
     running = True
     pending = deque()
     source_revision = Path(__file__).stat().st_mtime_ns
@@ -545,6 +559,15 @@ def gallery(db):
                     break
                 heartbeat = time.time()
                 put(db, heartbeat=heartbeat, pane=os.environ.get("HERDR_PANE_ID", ""))
+            if native_graphics() and time.monotonic() - label_checked > 5:
+                label_checked = time.monotonic()
+                label = workspace_label(cache.get("workspace_label"))
+                if label != cache.get("workspace_label"):
+                    cache["workspace_label"] = label
+                    # Update only the title; a rename must not reload the image.
+                    heading = gallery_heading(label, paused)[:terminal_size()[0] - 1]
+                    sys.stdout.write("\x1b[1;1H\x1b[2K\x1b[1;36m" + heading + "\x1b[0m")
+                    sys.stdout.flush()
             request = get(db, "request")
             if request != last_request and not paused:
                 selected, query = get(db, "requested_path"), ""

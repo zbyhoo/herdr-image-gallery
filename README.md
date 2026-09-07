@@ -1,143 +1,168 @@
 # Herdr Image Gallery
 
-A native [Herdr](https://herdr.dev) plugin for viewing generated images and local attachments without leaving the terminal.
+View AI-generated images, screenshots, and local artwork inside [Herdr](https://herdr.dev), without leaving your terminal. Browse a thumbnail grid, open a larger preview, or let Codex send images to the gallery as it creates them.
+
+The plugin includes an optional Codex skill and works independently through its CLI and local image links.
 
 ## Features
 
-- A dedicated gallery pane, with a thumbnail grid and a large preview.
-- Arrow-key and mouse selection, filtering, and LIVE/HOLD modes.
-- Direct publication from Codex through a companion skill.
-- Ctrl-click handlers for local image hyperlinks.
-- Persistent history, archived image copies, and restored selection/view.
-- Cached previews and native Herdr graphics layers that follow pane layout changes. Moving the thumbnail selection does not resend images.
-- Preview switching keeps the previous image until decoding completes; a centered spinner appears after 180 ms. Decode failures preserve the previous image.
-- User-owned layout: updates never reposition an existing pane.
+- **Thumbnail browsing:** select with arrow keys or click to open a preview.
+- **Smooth preview switching:** the current image stays visible while the next one loads, with a centered loading indicator for slower requests.
+- **Codex integration:** a bundled skill instructs Codex to send generated images and accessible local attachments to the gallery.
+- **Persistent history:** archived copies remain available even after temporary source files disappear.
+- **Flexible layout:** the gallery initially opens on the right and preserves your chosen pane position and size.
+- **Local storage:** images are not uploaded by the plugin, and source files are not modified.
 
 ## Requirements
 
-- macOS, Python 3.9+ and the system `/usr/bin/sips` image decoder.
-- Herdr 0.8.2 or newer.
-- An outer terminal supporting Kitty graphics, such as Ghostty.
-- No pip or npm dependencies.
+- macOS with Python 3.9 or later and the built-in `sips` image decoder.
+- Herdr 0.8.2 or later, with experimental Kitty graphics enabled.
+- A Kitty graphics-compatible terminal, such as Ghostty.
 
-In Herdr's `~/.config/herdr/config.toml`, enable:
+No pip or npm dependencies are required. Linux and Windows are not currently supported.
+
+## Quick start
+
+### 1. Enable graphics in Herdr
+
+Add the following to `~/.config/herdr/config.toml`. If an `[experimental]` section already exists, add the setting to that section.
 
 ```toml
 [experimental]
 kitty_graphics = true
 ```
 
-Then run `herdr server reload-config`, detach the client with Ctrl+B then Q, and reconnect with `herdr`. In Herdr 0.8.2 both server and client must load this setting. Do not stop the server.
-
-## Installation
-
-### From a local checkout
-
-From the repository root:
+Reload the server configuration:
 
 ```sh
+herdr server reload-config
+```
+
+Detach the Herdr client with **Ctrl+B, then Q**, and reconnect with `herdr`. These are the default shortcuts; use your configured detach binding if different. Herdr 0.8.2 requires both the server and client to load the setting. A server restart is not needed.
+
+### 2. Install and open the gallery
+
+Run inside Herdr:
+
+```sh
+herdr plugin install zbyhoo/herdr-image-gallery
+herdr plugin action invoke local.image-gallery.open
+```
+
+The plugin ID is `local.image-gallery` for both GitHub and local installations.
+
+### 3. Enable Codex integration (optional)
+
+On first opening, the gallery offers to register its bundled skill:
+
+- Press **y** to install it.
+- Press **Enter**, **Esc**, or **n** to skip.
+- Press **s** in the gallery to revisit setup later.
+
+Restart Codex after installing the skill, then use Codex from the same Herdr workspace. For example:
+
+> Generate an image and show it using the herdr-image-gallery skill.
+
+Registration creates a symlink at `${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery`. Use the same `CODEX_HOME` for setup and your Codex session. Existing files or unrelated links are never overwritten.
+
+The skill supplies instructions to Codex; it does not intercept image generation or automatically watch folders. Codex must load and follow the skill to publish images.
+
+## Controls
+
+Focus the gallery pane to use these keys.
+
+| Key or action | Result |
+| --- | --- |
+| Tab or g | Switch between thumbnails and preview |
+| Arrow keys / j k | Select or browse images |
+| Enter or click a thumbnail | Open the selected image |
+| PgUp / PgDn | Change thumbnail pages |
+| / | Filter titles and paths |
+| Esc | Finish filtering or return to thumbnails; never closes the gallery |
+| a | Toggle LIVE / HOLD |
+| f | Toggle fullscreen for the gallery pane |
+| s | Set up the Codex skill |
+| q | Close the gallery without deleting history |
+
+**LIVE** follows newly published images. **HOLD** keeps your current selection; switching back to LIVE displays the latest pending image.
+
+To reopen the gallery:
+
+```sh
+herdr plugin action invoke local.image-gallery.open
+```
+
+## Send images from scripts or the command line
+
+After registering the bundled skill, run this from the target Herdr workspace:
+
+```sh
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery/scripts/gallery.py" \
+  show /absolute/path/to/image.png \
+  --title 'Concept art' --caption 'A city at dusk' --wait 10
+```
+
+Without the skill, run `gallery.py` directly from the plugin directory. Locate the installed directory with `herdr plugin list --json`.
+
+| Command or option | Purpose |
+| --- | --- |
+| `show PATH` | Publish an image and open the gallery if needed |
+| `show PATH --no-open` | Queue an image without opening a pane |
+| `show PATH --wait 10` | Wait up to 10 seconds for delivery status |
+| `open` | Open or reuse the gallery |
+| `list` | Print image history as JSON |
+| `status` | Print viewer state and diagnostics as JSON |
+| `setup-codex` | Prompt to register the bundled Codex skill |
+| `setup-codex --yes` | Register the skill with explicit command-line consent |
+
+Publishing reuses the existing pane without changing keyboard focus. Native streams report `delivered: true` and `rendered: null`: submission does not independently confirm pixels on the host screen. `--wait` exits nonzero when delivery is not confirmed or decoding fails.
+
+## Open local image links
+
+Ctrl-click a hyperlink in either of these forms inside Herdr:
+
+- `file:///absolute/path/to/image.png`
+- `herdr-image://open?path=<URL-encoded absolute image path>`
+
+Use **Control** on macOS too. The terminal must recognize the text as a hyperlink. HTTP images are not downloaded, and plain unlinked paths do not invoke the handler.
+
+## Storage and supported formats
+
+The gallery supports PNG, JPEG, WebP, GIF, TIFF, BMP, and HEIC through the macOS system decoder. Animated images display a static frame.
+
+History and archived image copies are stored in `~/.local/state/herdr-image-gallery/`. Reopening in the same Herdr workspace restores history, selection, filter, and LIVE/HOLD state. History is separated by Herdr socket and workspace ID; a new workspace identity has its own history.
+
+Archived copies use disk space independently of the source files. Removing the plugin does not remove this history. `HERDR_GALLERY_STATE_DIR` overrides the storage directory.
+
+## Troubleshooting
+
+**The pane opens but images are blank.** Check Kitty graphics support in your outer terminal, enable the Herdr setting above, and detach/reconnect after reloading the configuration.
+
+**Images disappear while PREFIX mode is active.** Herdr 0.8.2 hides graphics in PREFIX mode. Leave that mode with Esc to restore them. This is a Herdr renderer limitation that the plugin cannot fix.
+
+**Codex does not send images.** Press `s` in the gallery, verify skill registration, and restart Codex. Run Codex inside the target Herdr workspace and ask it to use the gallery skill.
+
+**Skill setup reports an existing destination.** Inspect the reported path. If it is an obsolete symlink from an earlier installation, remove that link and retry setup. Preserve any files you still need.
+
+**Installation conflicts with a linked development checkout.** Unregister the local link with `herdr plugin unlink local.image-gallery`, then run the GitHub installation command. If the skill still points to the old checkout, update its registration before removing that checkout.
+
+## Development
+
+Clone the repository and link it to Herdr:
+
+```sh
+git clone https://github.com/zbyhoo/herdr-image-gallery.git
+cd herdr-image-gallery
 herdr plugin link "$PWD"
 herdr plugin action invoke local.image-gallery.open
 ```
 
-### From GitHub
-
-After this repository has been published (replace OWNER with the actual account):
-
-```sh
-herdr plugin install OWNER/herdr-image-gallery
-herdr plugin action invoke local.image-gallery.open
-```
-
-The stable plugin ID is `local.image-gallery`, regardless of the installation source. If switching this same plugin from a local link to GitHub installation, unregister the local link first with `herdr plugin unlink local.image-gallery`. Do not close or rearrange user panes as part of installation.
-
-## Controls
-
-| Key / action | Result |
-| --- | --- |
-| Tab or g | Switch between thumbnails and large preview |
-| Arrows / j k | Select or browse images |
-| Enter or click a thumbnail | Open the selected image |
-| PgUp / PgDn | Change thumbnail pages |
-| / | Filter titles and paths |
-| Esc | End filter editing or return to thumbnails; never closes the gallery |
-| a | Toggle LIVE / HOLD |
-| f | Toggle fullscreen for the current pane |
-| s | Set up the bundled Codex skill |
-| q | Close the gallery; history is retained |
-
-Reopen at any time with:
-
-```sh
-herdr plugin action invoke local.image-gallery.open
-```
-
-The initial pane opens to the right. Once opened, the user's position and size are preserved. Source updates reload in the same process and pane.
-
-## Send an image
-
-From inside the target Herdr workspace, using the path to your checkout:
-
-```sh
-python3 /path/to/herdr-image-gallery/gallery.py show /absolute/image.png \
-  --title 'Concept' --caption 'Art direction' --wait 10
-```
-
-`show` reuses the existing gallery without changing keyboard focus. It opens a pane only if the gallery is closed. `--no-open` queues the image without opening one. `--wait` exits nonzero if delivery is not confirmed or decoding fails. Native Herdr layers report `delivered: true` and `rendered: null`: inline streams do not acknowledge host pixels.
-
-Other commands: `open`, `list`, and `status`.
-
-LIVE follows explicit messages from the agent, not unrelated filesystem activity. HOLD postpones the latest request until resumed.
-
-## Codex integration
-
-The skill is bundled: no separate download is needed. On first opening, the gallery asks whether to register it with Codex. Press **y** to install, or **Enter / Esc / n** to skip. Press **s** in the gallery to revisit setup at any time. Skipping is remembered for this workspace.
-
-Registration creates a symlink under `${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery` pointing into the installed plugin, including a GitHub-managed installation. Existing unrelated files or links are preserved and reported as a conflict; inspect and remove an obsolete link yourself before retrying. Run setup with the same `CODEX_HOME` as your Codex session.
-
-Restart Codex after registration so it discovers the skill. The skill instructs Codex to publish final imagegen results and accessible local attachments. It does not intercept imagegen: Codex must load and follow the skill. The gallery also works without Codex through the CLI and local hyperlinks.
-
-For setup outside the viewer, run `python3 /path/to/herdr-image-gallery/gallery.py setup-codex`. This asks for consent; `--yes` explicitly consents for scripted installation. Uninstalling the plugin does not delete gallery history; remove its skill symlink separately if no longer needed.
-
-A portable helper is also available through the installed skill:
-
-```sh
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery/scripts/gallery.py" show /absolute/image.png --wait 10
-```
-
-## Clickable links
-
-Ctrl-click a `file:///absolute/image.png` hyperlink or a `herdr-image://open?path=<URL-encoded absolute path>` hyperlink in Herdr. Control is used on macOS too. The link handler opens the image in the existing gallery and preserves its title/caption.
-
-Only local images are handled; HTTP images are not downloaded. The terminal must expose the text as a hyperlink.
-
-## Persistence and formats
-
-History is stored under `~/.local/state/herdr-image-gallery/`, isolated by Herdr socket and workspace ID. Full image copies are stored in `images/`, deduplicated by content hash. Temporary source files can disappear without losing their archived images.
-
-Reopening in the same workspace restores history, selection, filter and LIVE/HOLD state. A different socket or workspace identity has separate history. No network listener or upload is used. `HERDR_GALLERY_STATE_DIR` overrides storage for isolated tests.
-
-PNG, JPEG, WebP, GIF, TIFF, BMP and HEIC are decoded by the macOS system codec. Animated formats display a static frame. Source files are not modified. Previews have a longest edge of at most 960 pixels and a 32-frame cache; final display latency also depends on Herdr and the outer terminal.
-
-
-Known Herdr 0.8.2 limitation: images are hidden while PREFIX mode is active and return after leaving it (for example with Esc). The host renderer restricts graphics to terminal mode; fixing this requires a Herdr change. The plugin's resize refresh does not fix PREFIX-mode visibility.
-
-## Development
+Run the tests from the repository root:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v
 ```
 
-Tests cover IPC, workspace isolation, image archiving, BMP decoding, links, thumbnail selection, layout reuse and interactive PTY restoration. Host rendering still requires visual verification in the actual terminal.
+Tests cover image history, decoding, preview replacement, loading indicators, Codex setup, links, and terminal navigation. Visual behavior also needs checking in Herdr with a compatible outer terminal.
 
-## Publishing this repository
-
-Create an empty GitHub repository (without an initial README), then:
-
-```sh
-git remote add origin git@github.com:OWNER/herdr-image-gallery.git
-git push -u origin main
-```
-
-Keep `herdr-plugin.toml` at the repository root. Adding the GitHub topic `herdr-plugin` makes the package eligible for discovery in the [Herdr marketplace](https://herdr.dev/docs/marketplace/).
-
+To report a problem, [open an issue](https://github.com/zbyhoo/herdr-image-gallery/issues) with your macOS, Herdr, and terminal versions, reproduction steps, and any error shown in the gallery. Review diagnostic output and screenshots for private paths or image content before sharing them.

@@ -24,6 +24,7 @@ class GalleryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.env = patch.dict(os.environ, {"HERDR_GALLERY_STATE_DIR": self.temp.name,
+                             "HERDR_GALLERY_AUTO_SETUP": "0", "CLAUDE_CONFIG_DIR": str(Path(self.temp.name) / "claude"),
                              "HERDR_PANE_ID": "", "CODEX_HOME": str(Path(self.temp.name) / "codex"), "HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w1",
                              "HERDR_SOCKET_PATH": "/tmp/test-herdr.sock"})
         self.env.start()
@@ -36,6 +37,45 @@ class GalleryTests(unittest.TestCase):
         self.db.close()
         self.env.stop()
         self.temp.cleanup()
+
+    def test_automatic_setup_detects_claude_without_codex(self):
+        gallery.agent_skill_paths("claude")[1].parent.parent.mkdir()
+        with patch.dict(os.environ, {"HERDR_GALLERY_AUTO_SETUP": "1"}), patch.object(gallery.shutil, "which", return_value=None):
+            results = gallery.auto_setup_agents()
+        self.assertEqual(set(results), {"claude"})
+        self.assertEqual(gallery.agent_skill_status("claude"), "installed")
+        self.assertEqual(gallery.agent_skill_status("codex"), "missing")
+        helper = gallery.agent_skill_paths("claude")[1] / "scripts" / "gallery.py"
+        result = subprocess.run([sys.executable, str(helper), "show", str(self.path), "--no-open"], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(gallery.get(self.db, "requested_path"), str(self.path.resolve()))
+
+    def test_auto_setup_preserves_conflict_and_installs_other_agent(self):
+        target = gallery.agent_skill_paths("claude")[1]
+        target.mkdir(parents=True)
+        (target / "custom.txt").write_text("keep")
+        results = gallery.setup_agents("both")
+        self.assertEqual(results["claude"]["status"], "error")
+        self.assertEqual((target / "custom.txt").read_text(), "keep")
+        self.assertEqual(gallery.agent_skill_status("codex"), "installed")
+        self.assertFalse(gallery.setup_agents("codex")["codex"]["changed"])
+
+    def test_auto_setup_opt_out_and_no_agents_create_nothing(self):
+        with patch.object(gallery.shutil, "which", return_value="/bin/fake-agent"):
+            self.assertEqual(gallery.auto_setup_agents(), {})
+        with patch.dict(os.environ, {"HERDR_GALLERY_AUTO_SETUP": "1"}), patch.object(gallery.shutil, "which", return_value=None):
+            self.assertEqual(gallery.auto_setup_agents(), {})
+        for agent in gallery.AGENTS:
+            self.assertFalse(gallery.agent_skill_paths(agent)[1].exists())
+
+    def test_claude_setup_cli_works_without_herdr_or_codex(self):
+        env = dict(os.environ)
+        for key in ("HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH"):
+            env.pop(key, None)
+        result = subprocess.run([sys.executable, gallery.__file__, "setup-claude", "--yes"], env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(gallery.agent_skill_status("claude"), "installed")
+        self.assertEqual(gallery.agent_skill_status("codex"), "missing")
 
     def test_preview_replacement_prepares_before_touching_previous_layer(self):
         gallery.publish(self.db, self.path)

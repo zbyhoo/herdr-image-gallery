@@ -1,6 +1,6 @@
 id = "local.image-gallery"
 name = "Image Gallery"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.2"
 description = "Browse project and generated images inside a Herdr terminal pane"
 platforms = ["macos"]
@@ -34,3 +34,7 @@ id = "gallery-image"
 title = "Open image in gallery"
 pattern = '^herdr-image://open\?path='
 action = "show-link"
+
+# Register bundled skills for installed agents when a server starts.
+[[startup]]
+command = ["/usr/bin/python3", "gallery.py", "auto-setup"]

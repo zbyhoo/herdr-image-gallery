@@ -14,6 +14,7 @@ import select
 import signal
 import sqlite3
 import socket
+import shutil
 import math
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import struct
@@ -402,8 +403,8 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
     line(1, gallery_heading(cache.get("workspace_label", os.environ["HERDR_WORKSPACE_ID"]), paused), "1;36")
     line(2, "Tab: thumbnails  arrows: select  Enter: open  /: filter  a: live/hold  f: zoom  q: close", "90")
     if not items:
-        line(4, "Waiting for Codex to send an image." if not query else "No matching images.")
-        line(rows, "/ " + query if searching else "Codex: gallery.py show /absolute/path/image.png")
+        line(4, "Waiting for an agent to send an image." if not query else "No matching images.")
+        line(rows, "/ " + query if searching else "CLI: gallery.py show /absolute/path/image.png")
         sys.stdout.flush()
         return ""
     item = items[index]
@@ -456,46 +457,95 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
         line(6, "Cannot display: " + error, "31")
     line(rows - 3, item["caption"], "37")
     line(rows - 2, item["path"], "90")
-    line(rows, "/ " + query if searching else "LIVE: new Codex images appear automatically.  s: Codex setup", "36")
+    line(rows, "/ " + query if searching else "LIVE: new agent images appear automatically.  s: agent setup", "36")
     sys.stdout.flush()
     return error
 
 
-def codex_skill_paths():
+AGENTS = {"codex": ("CODEX_HOME", ".codex", "Codex"),
+          "claude": ("CLAUDE_CONFIG_DIR", ".claude", "Claude Code")}
+
+
+def agent_skill_paths(agent):
+    variable, directory, _ = AGENTS[agent]
     source = Path(__file__).resolve().parent / "skills" / "herdr-image-gallery"
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    home = Path(os.environ.get(variable) or Path.home() / directory).expanduser().resolve()
     return source, home / "skills" / "herdr-image-gallery"
 
 
-def codex_skill_status():
-    source, target = codex_skill_paths()
+def detected_agents():
+    return [agent for agent in AGENTS
+            if agent_skill_paths(agent)[1].parent.parent.is_dir() or shutil.which(agent)]
+
+
+def agent_skill_status(agent):
+    source, target = agent_skill_paths(agent)
     if target.is_symlink() and target.resolve() == source.resolve():
         return "installed"
     return "conflict" if target.exists() or target.is_symlink() else "missing"
 
 
-def install_codex_skill():
-    source, target = codex_skill_paths()
+def install_agent_skill(agent):
+    source, target = agent_skill_paths(agent)
     if not (source / "SKILL.md").is_file():
-        raise RuntimeError("Bundled Codex skill is missing; reinstall this plugin.")
-    status = codex_skill_status()
+        raise RuntimeError("Bundled agent skill is missing; reinstall this plugin.")
+    status = agent_skill_status(agent)
     if status == "conflict":
         raise RuntimeError("Existing skill preserved: " + str(target))
     if status != "installed":
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.symlink_to(source, target_is_directory=True)
-    return "Codex skill installed. Restart Codex to load it."
+        try:
+            target.symlink_to(source, target_is_directory=True)
+        except FileExistsError:
+            # Concurrent gallery openings may install the same skill.
+            if agent_skill_status(agent) != "installed":
+                raise RuntimeError("Existing skill preserved: " + str(target))
+    return AGENTS[agent][2] + " skill installed. Restart Codex if needed; in Claude use /herdr-image-gallery."
+
+
+def setup_agents(selection="auto"):
+    agents = detected_agents() if selection == "auto" else list(AGENTS) if selection == "both" else [selection]
+    results = {}
+    for agent in agents:
+        before = agent_skill_status(agent)
+        try:
+            install_agent_skill(agent)
+            results[agent] = {"status": "installed", "changed": before != "installed",
+                              "path": str(agent_skill_paths(agent)[1])}
+        except (OSError, RuntimeError) as exc:
+            results[agent] = {"status": "error", "error": str(exc)}
+    return results
+
+
+def auto_setup_agents():
+    if os.environ.get("HERDR_GALLERY_AUTO_SETUP", "1") == "0":
+        return {}
+    return setup_agents()
+
+
+# Keep the original public helpers and CLI command compatible.
+def codex_skill_paths():
+    return agent_skill_paths("codex")
+
+
+def codex_skill_status():
+    return agent_skill_status("codex")
+
+
+def install_codex_skill():
+    return install_agent_skill("codex")
 
 
 def setup_key(key):
-    # Explicit consent only. Enter and Escape decline; terminal replies are ignored upstream.
-    if key.lower() == "y":
-        try:
-            return False, install_codex_skill()
-        except (OSError, RuntimeError) as exc:
-            return False, str(exc)
+    selection = {"y": "both", "c": "codex", "l": "claude"}.get(key.lower())
+    if selection:
+        results = setup_agents(selection)
+        errors = [result["error"] for result in results.values() if result["status"] == "error"]
+        if errors:
+            return False, "; ".join(errors)
+        return False, "Skills ready. Claude: /herdr-image-gallery. Restart Codex if needed."
     if key.lower() == "n" or key in ("\r", "\n", "\x1b"):
-        return False, "Skipped. Press s to set up Codex later."
+        return False, "Skipped. Press s to set up agent skills later."
     return True, ""
 
 
@@ -532,7 +582,7 @@ def gallery(db):
     paused = resume.get("paused", False)
     mode = resume.get("mode", "preview")
     cache, previous, heartbeat = {}, None, 0
-    setup = codex_skill_status() != "installed" and not get(db, "codex_setup_dismissed")
+    setup = any(agent_skill_status(a) != "installed" for a in (detected_agents() or list(AGENTS))) and not get(db, "codex_setup_dismissed")
     setup_message = ""
     label_checked = 0
     running = True
@@ -591,7 +641,7 @@ def gallery(db):
                     put(db, terminal_reply="OK" if not error else error, terminal_request=last_request,
                         acknowledgement="herdr-stream-submitted")
                 if setup or setup_message:
-                    message = "Enable bundled Codex skill? y: install / Enter, Esc, n: later" if setup else setup_message
+                    message = "Agent setup: y both / c Codex / l Claude / Esc later" if setup else setup_message
                     cols, rows = terminal_size()[:2]
                     sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[36m%s\x1b[0m" % (rows, clean(message)[:cols - 1]))
                     sys.stdout.flush()
@@ -651,10 +701,7 @@ def gallery(db):
             if key == "q":
                 break
             if key == "s":
-                if codex_skill_status() == "installed":
-                    setup_message = "Codex skill is installed. Restart Codex if it has not loaded it."
-                else:
-                    setup, setup_message = True, ""
+                setup, setup_message = True, ""
             elif key in ("\t", "g"):
                 mode = "preview" if mode == "grid" else "grid"
             elif key in ("\r", "\n") and mode == "grid":
@@ -695,25 +742,42 @@ def gallery(db):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="view", choices=["view", "show", "open", "list", "status", "link", "setup-codex"])
+    parser.add_argument("command", nargs="?", default="view", choices=["view", "show", "open", "list", "status", "link", "setup-codex", "setup-claude", "setup-agents", "agent-status", "auto-setup"])
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--title", default="")
     parser.add_argument("--caption", default="")
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--open", action="store_true", dest="open_action")
-    parser.add_argument("--yes", action="store_true", help="Consent to install the bundled Codex skill (setup-codex only)")
+    parser.add_argument("--agent", choices=["auto", "both", "codex", "claude"], default="auto")
+    parser.add_argument("--yes", action="store_true", help="Register bundled agent skills without prompting")
     parser.add_argument("--wait", type=float, default=0)
     args = parser.parse_args()
-    if args.command == "setup-codex":
+    if args.command == "auto-setup":
+        results = auto_setup_agents()
+        print(json.dumps(results))
+        return 1 if any(r["status"] == "error" for r in results.values()) else 0
+    if args.command == "agent-status":
+        print(json.dumps({a: {"status": agent_skill_status(a), "path": str(agent_skill_paths(a)[1])}
+                          for a in AGENTS}))
+        return 0
+    if args.command in ("setup-codex", "setup-claude", "setup-agents"):
+        selection = {"setup-codex": "codex", "setup-claude": "claude"}.get(args.command, args.agent)
         if not args.yes:
             if not sys.stdin.isatty():
-                parser.error("setup-codex requires interactive consent or --yes")
-            print("Register bundled skill at %s?" % codex_skill_paths()[1])
-            if input("Install? [y/N] ").strip().lower() != "y":
+                parser.error("agent setup requires interactive consent or --yes")
+            if input("Register bundled skill for %s? [y/N] " % selection).strip().lower() != "y":
                 print("Skipped; no files changed.")
                 return 0
-        print(install_codex_skill())
-        return 0
+        results = setup_agents(selection)
+        print(json.dumps(results))
+        return 1 if any(r["status"] == "error" for r in results.values()) else 0
+    if args.command in ("view", "open", "show", "link") or args.open_action:
+        results = auto_setup_agents()
+        for agent, result in results.items():
+            if result["status"] == "error":
+                print("Agent setup: " + result["error"], file=sys.stderr)
+            elif result["changed"]:
+                print(AGENTS[agent][2] + " gallery skill registered.", file=sys.stderr)
     if args.command == "link":
         context = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}"))
         url = os.environ.get("HERDR_PLUGIN_CLICKED_URL") or context.get("clicked_url", "")

@@ -5,11 +5,17 @@ description: Show generated images, imagegen results, screenshots and locally ac
 
 # Herdr Image Gallery
 
-The user wants graphics displayed in a terminal gallery as soon as Codex creates or receives them. Check `HERDR_ENV=1` and `HERDR_WORKSPACE_ID`; outside Herdr use the normal image presentation flow.
+The user wants graphics displayed in a terminal gallery as soon as the agent (Codex or Claude Code) creates or receives them. Check `HERDR_ENV=1` and `HERDR_WORKSPACE_ID`; outside Herdr use the normal image presentation flow.
 
 After each final image is saved (including imagegen output), send its absolute local path immediately, before the final answer. Also send user-attached images when their local file paths are available. Do not claim an attachment is available when you only have its visual conversation representation; ask for a local path only if showing it in the gallery is necessary.
 
-Use the bundled `scripts/gallery.py` helper, resolving this skill's directory from its actual installed location. It resolves symlinks and forwards to the plugin checkout. With the default Codex skill directory:
+Use the bundled `scripts/gallery.py` helper, resolving this skill's directory from its actual installed location. It resolves symlinks and forwards to the plugin checkout. Resolve the helper relative to the directory containing this SKILL.md; never assume the caller uses Codex. In Claude Code use:
+
+```sh
+python3 "${CLAUDE_SKILL_DIR}/scripts/gallery.py" show '/absolute/path/image.png' --title 'Short title' --caption 'Short description' --wait 10
+```
+
+`CLAUDE_SKILL_DIR` is substituted by Claude Code in this skill, not assumed to be a shell environment variable. If unavailable, use the actual skill directory from the loaded skill path. In Codex, with the default skill directory:
 
 ```sh
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery/scripts/gallery.py" show '/absolute/path/image.png' --title 'Short title' --caption 'Short description' --wait 10
@@ -28,3 +34,7 @@ For a clickable gallery link, use `herdr-image://open?path=<URL-encoded absolute
 Self-service opening: `herdr plugin action invoke local.image-gallery.open`. Controls: Tab or g toggles the thumbnail grid; arrows select; Enter or click opens a thumbnail. `/` filters, `a` toggles LIVE/HOLD, `f` toggles pane fullscreen, `q` closes the viewer without deleting history. Files are never uploaded or altered. Archival copies and view state survive reopening in the same Herdr socket/workspace; a different workspace has separate history.
 
 Escape must never close the gallery: it ends filter editing or returns to thumbnails. Only q closes it. Preserve this explicit user preference when changing navigation.
+
+The gallery does not provide an image-generation service. Use the agent's available tools to create images; publish any resulting local files. The shared gallery is scoped to the Herdr workspace, not to one agent, so Codex and Claude Code can contribute to the same history. If another agent publishes a new image, LIVE follows it; HOLD preserves the user's selection.
+
+If Herdr reports that local.image-gallery is not installed, explain that the gallery skill needs its native Herdr plugin. When the user has requested gallery setup, run `herdr plugin install zbyhoo/herdr-image-gallery --yes`, then `herdr plugin action invoke local.image-gallery.open`. Do not replace an already linked plugin or change its source automatically. Installing the skill alone does not grant permission for unrelated installs or to alter the terminal layout.

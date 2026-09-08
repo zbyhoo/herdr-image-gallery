@@ -15,11 +15,15 @@ The plugin includes a shared Codex / Claude Code skill and works independently t
 
 ## Requirements
 
-- macOS with Python 3.9 or later and the built-in `sips` image decoder.
+- Python 3.9 or later.
+- macOS: the built-in `sips` image decoder.
+- Linux: ImageMagick (`magick` or `convert`) for image decoding; `wl-clipboard` for copying on Wayland, or `xclip` on X11.
 - Herdr 0.8.2 or later, with experimental Kitty graphics enabled.
 - A Kitty graphics-compatible terminal, such as Ghostty.
 
-No pip or npm dependencies are required. Linux and Windows are not currently supported.
+No pip or npm dependencies are required. Windows is not currently supported.
+
+On Arch Linux / Omarchy, install Linux dependencies with `sudo pacman -S imagemagick wl-clipboard` (use `xclip` instead of `wl-clipboard` on X11). On Debian / Ubuntu, use `sudo apt install imagemagick wl-clipboard`. Clipboard tools are optional for viewing images.
 
 ## Quick start
 
@@ -95,7 +99,7 @@ Focus the gallery pane to use these keys.
 | Tab or g | Switch between thumbnails and preview |
 | Arrow keys / j k | Select or browse images |
 | Enter or click a thumbnail | Open the selected image |
-| c | Copy the selected image to the macOS clipboard at full resolution |
+| c | Copy the selected image to the system clipboard at full resolution |
 | PgUp / PgDn | Change thumbnail pages |
 | / | Filter titles and paths |
 | Esc | Finish filtering or return to thumbnails; never closes the gallery |
@@ -160,7 +164,7 @@ Use **Control** on macOS too. The terminal must recognize the text as a hyperlin
 
 ## Storage and supported formats
 
-The gallery supports PNG, JPEG, WebP, GIF, TIFF, BMP, and HEIC through the macOS system decoder. Animated images display a static frame.
+The gallery supports PNG, JPEG, WebP, GIF, TIFF, BMP, and HEIC through the macOS system decoder or ImageMagick on Linux. Linux format availability depends on the codecs included in your ImageMagick build (especially HEIC). Animated images display a static frame.
 
 History and archived image copies are stored in `~/.local/state/herdr-image-gallery/`. Reopening in the same Herdr workspace restores history, selection, filter, and LIVE/HOLD state. History is separated by Herdr socket and workspace ID; a new workspace identity has its own history.
 
@@ -197,6 +201,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v
 
 Tests cover image history, decoding, preview replacement, loading indicators, agent setup, links, and terminal navigation. Visual behavior also needs checking in Herdr with a compatible outer terminal.
 
-To report a problem, [open an issue](https://github.com/zbyhoo/herdr-image-gallery/issues) with your macOS, Herdr, and terminal versions, reproduction steps, and any error shown in the gallery. Review diagnostic output and screenshots for private paths or image content before sharing them.
+To report a problem, [open an issue](https://github.com/zbyhoo/herdr-image-gallery/issues) with your OS, Herdr, and terminal versions, reproduction steps, and any error shown in the gallery. Review diagnostic output and screenshots for private paths or image content before sharing them.
 
 Agent integration follows the documented [Claude Code skill directories and invocation](https://code.claude.com/docs/en/skills). Normal agent permissions still apply; installing the gallery does not grant unrestricted shell access.

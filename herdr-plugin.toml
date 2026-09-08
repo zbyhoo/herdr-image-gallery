@@ -3,7 +3,7 @@ name = "Image Gallery"
 version = "0.2.0"
 min_herdr_version = "0.8.2"
 description = "Browse project and generated images inside a Herdr terminal pane"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 [[panes]]
 id = "gallery"

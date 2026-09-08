@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Herdr image pane and workspace-scoped CLI; Python stdlib + macOS sips."""
+"""Herdr image pane and workspace-scoped CLI; sips or ImageMagick codecs."""
 import argparse
 import base64
 from collections import deque
@@ -124,21 +124,63 @@ function run(argv) {
 """
 
 
+def imagemagick():
+    executable = shutil.which("magick") or shutil.which("convert")
+    if not executable:
+        raise RuntimeError("Install ImageMagick to decode images on Linux (magick or convert required).")
+    return executable
+
+
+def convert_image(path, output, max_pixels=None):
+    if sys.platform == "darwin":
+        command = ["/usr/bin/sips", "-s", "format", output.suffix[1:]]
+        if max_pixels is not None:
+            command += ["-Z", str(max_pixels)]
+        command += [str(path), "--out", str(output)]
+    elif sys.platform.startswith("linux"):
+        # An absolute path cannot become an option; [0] selects a static frame.
+        command = [imagemagick(), str(Path(path).resolve()) + "[0]", "-auto-orient"]
+        if max_pixels is not None:
+            command += ["-thumbnail", f"{max_pixels}x{max_pixels}>",
+                        "-background", "black", "-alpha", "remove", "-alpha", "off",
+                        "-type", "TrueColor", "-depth", "8"]
+        command += [("BMP3:" if output.suffix == ".bmp" else "PNG:") + str(output)]
+    else:
+        raise RuntimeError("Image Gallery supports macOS and Linux.")
+    result = subprocess.run(command, capture_output=True, timeout=20)
+    if result.returncode or not output.is_file():
+        raise ValueError("System image decoder could not read this file.")
+
+
 def copy_image(item):
     # Use the archived original, never the resized RGB preview. PNG preserves
-    # full resolution and transparency across all formats accepted by sips.
+    # full resolution and transparency across all supported formats.
     with tempfile.TemporaryDirectory(prefix="herdr-gallery-copy-") as tmp:
         output = Path(tmp) / "clipboard.png"
-        decoded = subprocess.run(["/usr/bin/sips", "-s", "format", "png",
-                                  str(display_path(item)), "--out", str(output)],
-                                 capture_output=True, timeout=20)
-        if decoded.returncode or not output.is_file():
-            raise ValueError("System image decoder could not read this file.")
-        result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e",
-                                 COPY_IMAGE_SCRIPT, str(output)],
-                                capture_output=True, text=True, timeout=10)
+        convert_image(display_path(item), output)
+        if sys.platform.startswith("linux"):
+            if os.environ.get("WAYLAND_DISPLAY"):
+                executable = shutil.which("wl-copy")
+                command = [executable, "--type", "image/png"]
+                required = "wl-clipboard (wl-copy)"
+            elif os.environ.get("DISPLAY"):
+                executable = shutil.which("xclip")
+                command = [executable, "-selection", "clipboard", "-t", "image/png", "-i"]
+                required = "xclip"
+            else:
+                raise RuntimeError("Image copying requires a Wayland or X11 graphical session.")
+            if not executable:
+                raise RuntimeError("Install " + required + " to copy images in this session.")
+            result = subprocess.run(command, input=output.read_bytes(),
+                                    capture_output=True, timeout=10)
+            error = result.stderr.decode(errors="replace").strip()
+        else:
+            result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e",
+                                     COPY_IMAGE_SCRIPT, str(output)],
+                                    capture_output=True, text=True, timeout=10)
+            error = result.stderr.strip()
         if result.returncode:
-            raise RuntimeError(result.stderr.strip() or "Cannot write image to clipboard.")
+            raise RuntimeError(error or "Cannot write image to clipboard.")
 
 
 def copy_selection(items, index):
@@ -239,10 +281,7 @@ def image_data(path, max_pixels):
     # Decode and resize using the system codec, without altering source files.
     with tempfile.TemporaryDirectory(prefix="herdr-gallery-") as tmp:
         output = Path(tmp) / "preview.bmp"
-        result = subprocess.run(["/usr/bin/sips", "-s", "format", "bmp", "-Z", str(max_pixels),
-                                 str(path), "--out", str(output)], capture_output=True, timeout=20)
-        if result.returncode or not output.exists():
-            raise ValueError("System image decoder could not read this file.")
+        convert_image(path, output, max_pixels)
         data = output.read_bytes()
     return decode_bmp(data)
 
@@ -254,6 +293,11 @@ def preview(path, modified, available_width, available_height):
         header = source.read(24)
     if header[:8] == b"\x89PNG\r\n\x1a\n":
         width, height = struct.unpack(">II", header[16:24])
+    elif sys.platform.startswith("linux"):
+        metadata = subprocess.run([imagemagick(), str(Path(path).resolve()) + "[0]",
+                                   "-auto-orient", "-format", "%w %h", "info:"],
+                                  capture_output=True, text=True, check=True, timeout=10).stdout
+        width, height = map(int, metadata.split())
     else:
         metadata = subprocess.run(["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
                                   capture_output=True, text=True, check=True, timeout=10).stdout

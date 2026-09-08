@@ -20,6 +20,69 @@ from unittest.mock import patch
 import gallery
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux image integration")
+class LinuxImageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "image with spaces.png"
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        self.path.write_bytes(b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", 1100, 2, 8, 6, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress((b"\0" + b"\xff\0\0\x80" * 1100) * 2)) + chunk(b"IEND", b""))
+
+    def test_preview_decodes_png_jpeg_and_first_gif_frame(self):
+        for extension in ("png", "jpg", "gif", "webp", "tiff", "bmp"):
+            with self.subTest(extension=extension):
+                path = self.path.with_suffix("." + extension)
+                if extension != "png":
+                    subprocess.run([gallery.imagemagick(), str(self.path), str(path)], check=True, capture_output=True)
+                data, width, height = gallery.preview(str(path), path.stat().st_mtime_ns, 550, 100)
+                self.assertEqual((width, height), (550, 1))
+                self.assertEqual(len(zlib.decompress(base64.b64decode(data))), width * height * 3)
+        animation = self.path.with_name("animated.gif")
+        subprocess.run([gallery.imagemagick(), "-size", "2x2", "xc:red", "xc:blue", str(animation)], check=True)
+        rgb, width, height = gallery.image_data(animation, 20)
+        self.assertEqual((width, height, rgb), (2, 2, b"\xff\0\0" * 4))
+
+    def test_copy_uses_archived_png_with_full_resolution_and_alpha(self):
+        item = {"path": "/deleted/original.png", "cached_path": str(self.path)}
+        real_run = subprocess.run
+        for environment, executable, expected in (
+            ({"WAYLAND_DISPLAY": "wayland-test", "DISPLAY": ":0"}, "/mock/wl-copy", ["--type", "image/png"]),
+            ({"WAYLAND_DISPLAY": "", "DISPLAY": ":0"}, "/mock/xclip", ["-selection", "clipboard", "-t", "image/png", "-i"]),
+        ):
+            copied = []
+            def run(command, **kwargs):
+                if command[0] == executable:
+                    self.assertEqual(command[1:], expected)
+                    copied.append(kwargs["input"])
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+                return real_run(command, **kwargs)
+            real_which = gallery.shutil.which
+            with patch.dict(os.environ, environment), patch.object(gallery.subprocess, "run", side_effect=run), \
+                 patch.object(gallery.shutil, "which", side_effect=lambda name: executable if name in ("wl-copy", "xclip") else real_which(name)):
+                gallery.copy_image(item)
+            output = self.path.with_name("copied.png")
+            output.write_bytes(copied[0])
+            metadata = real_run([gallery.imagemagick(), str(output), "-format", "%w %h %[pixel:p{0,0}]", "info:"],
+                                check=True, capture_output=True, text=True).stdout
+            self.assertTrue(metadata.startswith("1100 2 srgba(255,0,0,0.50196"), metadata)
+
+    def test_missing_decoder_reports_dependency(self):
+        with patch.object(gallery.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "Install ImageMagick"):
+                gallery.image_data(self.path, 50)
+
+    def test_missing_clipboard_tool_reports_dependency(self):
+        real_which = gallery.shutil.which
+        with patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-test"}), \
+             patch.object(gallery.shutil, "which", side_effect=lambda name: None if name == "wl-copy" else real_which(name)):
+            with self.assertRaisesRegex(RuntimeError, "Install wl-clipboard"):
+                gallery.copy_image({"path": str(self.path), "cached_path": None})
+
+
 class GalleryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -38,6 +101,7 @@ class GalleryTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS pasteboard integration")
     def test_copy_preserves_archived_resolution_and_alpha_on_macos_pasteboard(self):
         def chunk(kind, data):
             return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
@@ -76,7 +140,8 @@ class GalleryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gallery.copy_image(item)
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0][0], "/usr/bin/sips")
+        self.assertEqual(run.call_args.args[0][0],
+                         "/usr/bin/sips" if sys.platform == "darwin" else gallery.imagemagick())
 
     def test_copy_empty_selection_and_failure_report_without_redrawing(self):
         with patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \

@@ -109,6 +109,52 @@ def display_path(item):
     return Path(item["cached_path"] or item["path"])
 
 
+COPY_IMAGE_SCRIPT = """
+ObjC.import('AppKit');
+function run(argv) {
+    const data = $.NSData.dataWithContentsOfFile(argv[0]);
+    if (!data || !data.length) throw new Error('Cannot read clipboard image.');
+    const board = $.NSPasteboard.generalPasteboard;
+    if (typeof board.setDataForType !== 'function')
+        throw new Error('Cannot access the macOS clipboard.');
+    board.clearContents;
+    if (!board.setDataForType(data, $.NSPasteboardTypePNG))
+        throw new Error('Cannot write image to clipboard.');
+}
+"""
+
+
+def copy_image(item):
+    # Use the archived original, never the resized RGB preview. PNG preserves
+    # full resolution and transparency across all formats accepted by sips.
+    with tempfile.TemporaryDirectory(prefix="herdr-gallery-copy-") as tmp:
+        output = Path(tmp) / "clipboard.png"
+        decoded = subprocess.run(["/usr/bin/sips", "-s", "format", "png",
+                                  str(display_path(item)), "--out", str(output)],
+                                 capture_output=True, timeout=20)
+        if decoded.returncode or not output.is_file():
+            raise ValueError("System image decoder could not read this file.")
+        result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e",
+                                 COPY_IMAGE_SCRIPT, str(output)],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "Cannot write image to clipboard.")
+
+
+def copy_selection(items, index):
+    message, color = "No image selected.", "33"
+    if items:
+        try:
+            copy_image(items[index])
+            message, color = "Image copied to clipboard.", "36"
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            message, color = "Cannot copy: " + str(exc), "31"
+    # Only update the footer: copying must not reload or flash the preview.
+    cols, rows = terminal_size()[:2]
+    sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[%sm%s\x1b[0m" % (rows, color, clean(message)[:cols - 1]))
+    sys.stdout.flush()
+
+
 def publish(db, path, title="", caption=""):
     path = image_path(path)
     cached = archive(db, path)
@@ -401,7 +447,7 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
         sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[%sm%s\x1b[0m" % (row, color, clean(text)[:cols - 1]))
 
     line(1, gallery_heading(cache.get("workspace_label", os.environ["HERDR_WORKSPACE_ID"]), paused), "1;36")
-    line(2, "Tab: thumbnails  arrows: select  Enter: open  /: filter  a: live/hold  f: zoom  q: close", "90")
+    line(2, "c: copy image  Tab: thumbnails  arrows: select  Enter: open  /: filter  a: live/hold  f: zoom  q: close", "90")
     if not items:
         line(4, "Waiting for an agent to send an image." if not query else "No matching images.")
         line(rows, "/ " + query if searching else "CLI: gallery.py show /absolute/path/image.png")
@@ -702,6 +748,8 @@ def gallery(db):
                 break
             if key == "s":
                 setup, setup_message = True, ""
+            elif key == "c":
+                copy_selection(items, index)
             elif key in ("\t", "g"):
                 mode = "preview" if mode == "grid" else "grid"
             elif key in ("\r", "\n") and mode == "grid":

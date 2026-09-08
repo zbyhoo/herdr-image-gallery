@@ -38,6 +38,57 @@ class GalleryTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
+    def test_copy_preserves_archived_resolution_and_alpha_on_macos_pasteboard(self):
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1100, 2, 8, 6, 0, 0, 0))
+        png += chunk(b"IDAT", zlib.compress((b"\0" + b"\xff\0\0\x80" * 1100) * 2)) + chunk(b"IEND", b"")
+        self.path.write_bytes(png)
+        gallery.publish(self.db, self.path)
+        item = self.db.execute("SELECT * FROM images").fetchone()
+        self.path.unlink()
+        # Exercise the real macOS bridge without touching the user's clipboard.
+        board = '$.NSPasteboard.pasteboardWithName(' + json.dumps("herdr-gallery-test-" + self.temp.name) + ')'
+        script = gallery.COPY_IMAGE_SCRIPT.replace("$.NSPasteboard.generalPasteboard", board)
+        try:
+            with patch.object(gallery, "COPY_IMAGE_SCRIPT", script):
+                gallery.copy_image(item)
+            result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", """
+                ObjC.import('AppKit');
+                const data = BOARD.dataForType($.NSPasteboardTypePNG);
+                const rep = $.NSBitmapImageRep.imageRepWithData(data);
+                JSON.stringify([Number(rep.pixelsWide), Number(rep.pixelsHigh), !!rep.hasAlpha,
+                                Number(rep.colorAtXY(0, 0).alphaComponent)]);
+            """.replace("BOARD", board)], capture_output=True, text=True, check=True, timeout=10)
+            width, height, alpha, opacity = json.loads(result.stdout)
+            self.assertEqual((width, height, alpha), (1100, 2, True))
+            self.assertAlmostEqual(opacity, 128 / 255, places=3)
+        finally:
+            subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e",
+                            "ObjC.import('AppKit'); " + board + ".releaseGlobally;"],
+                           capture_output=True, timeout=10)
+
+    def test_copy_decode_failure_does_not_write_clipboard(self):
+        gallery.publish(self.db, self.path)
+        item = self.db.execute("SELECT * FROM images").fetchone()
+        real_run = subprocess.run
+        with patch.object(gallery.subprocess, "run", wraps=real_run) as run:
+            with self.assertRaises(ValueError):
+                gallery.copy_image(item)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][0], "/usr/bin/sips")
+
+    def test_copy_empty_selection_and_failure_report_without_redrawing(self):
+        with patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch.object(gallery, "copy_image", side_effect=RuntimeError("clipboard unavailable")) as copy, \
+             patch.object(gallery, "transmit") as send, patch("sys.stdout", new=io.StringIO()) as output:
+            gallery.copy_selection([], 0)
+            copy.assert_not_called()
+            self.assertIn("No image selected", output.getvalue())
+            gallery.copy_selection([{}], 0)
+            self.assertIn("Cannot copy: clipboard unavailable", output.getvalue())
+            send.assert_not_called()
+
     def test_automatic_setup_detects_claude_without_codex(self):
         gallery.agent_skill_paths("claude")[1].parent.parent.mkdir()
         with patch.dict(os.environ, {"HERDR_GALLERY_AUTO_SETUP": "1"}), patch.object(gallery.shutil, "which", return_value=None):
@@ -316,9 +367,18 @@ class GalleryTests(unittest.TestCase):
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 99, 792, 448))
         env = dict(os.environ)
         env.pop("HERDR_GALLERY_RESUME", None)
+        copied = Path(self.temp.name) / "copied.jsonl"
+        bootstrap = """
+import json, gallery
+def copy_image(item):
+    with open(%r, 'a') as log:
+        log.write(json.dumps(dict(item)) + '\\n')
+gallery.copy_image = copy_image
+gallery.gallery(gallery.connect())
+""" % str(copied)
 
         def start():
-            return subprocess.Popen([sys.executable, str(Path(gallery.__file__))], stdin=slave, stdout=slave, stderr=slave, env=env)
+            return subprocess.Popen([sys.executable, "-c", bootstrap], stdin=slave, stdout=slave, stderr=slave, env=env)
 
         output = bytearray()
 
@@ -350,8 +410,18 @@ class GalleryTests(unittest.TestCase):
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 85, 680, 448))
             wait_for(proc, lambda: output.count(b"a=T,f=24") >= before + 3)
             self.assertEqual(state().get("path"), str(other.resolve()))
+            os.write(master, b"c")
+            wait_for(proc, lambda: b"Image copied to clipboard." in output)
+            self.assertEqual(json.loads(copied.read_text())["path"], str(other.resolve()))
             os.write(master, b"\t")
             wait_for(proc, lambda: state().get("mode") == "grid")
+            os.write(master, b"c")
+            wait_for(proc, lambda: len(copied.read_text().splitlines()) == 2)
+            os.write(master, b"/c")
+            wait_for(proc, lambda: state().get("query") == "c")
+            self.assertEqual(len(copied.read_text().splitlines()), 2)
+            os.write(master, b"\x7f\r")
+            wait_for(proc, lambda: state().get("query") == "")
             os.write(master, b"\x1b[C\r")
             wait_for(proc, lambda: state().get("mode") == "preview" and state().get("path") == str(self.path.resolve()))
             os.write(master, b"\x1b")

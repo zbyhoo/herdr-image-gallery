@@ -95,6 +95,7 @@ Focus the gallery pane to use these keys.
 | Tab or g | Switch between thumbnails and preview |
 | Arrow keys / j k | Select or browse images |
 | Enter or click a thumbnail | Open the selected image |
+| c | Copy the selected image to the macOS clipboard at full resolution |
 | PgUp / PgDn | Change thumbnail pages |
 | / | Filter titles and paths |
 | Esc | Finish filtering or return to thumbnails; never closes the gallery |
@@ -104,6 +105,8 @@ Focus the gallery pane to use these keys.
 | q | Close the gallery without deleting history |
 
 **LIVE** follows newly published images. **HOLD** keeps your current selection; switching back to LIVE displays the latest pending image.
+
+Press **c** in either thumbnails or preview to copy the selected image, then paste it into an app that accepts images. Copying preserves full resolution and transparency, uses the archived image even if the original file is gone, and displays a confirmation or error in the footer. Animated images copy as a static frame. While editing a filter, `c` types into the filter; in agent setup, it selects Codex.
 
 To reopen the gallery:
 

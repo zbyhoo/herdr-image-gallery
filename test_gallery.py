@@ -518,6 +518,155 @@ gallery.gallery(gallery.connect())
             os.close(master)
             os.close(slave)
 
+    def test_scan_directory_filters_sorts_caps_and_recursion(self):
+        root = Path(self.temp.name) / "album"
+        nested = root / "nested"
+        hidden = root / ".secret"
+        nested.mkdir(parents=True)
+        hidden.mkdir()
+        (root / "b.png").write_bytes(b"b")
+        (root / "A.PNG").write_bytes(b"A")
+        (root / "notes.txt").write_bytes(b"no")
+        (root / ".dot.png").write_bytes(b"dot")
+        (nested / "z.png").write_bytes(b"z")
+        (hidden / "x.png").write_bytes(b"x")
+        (root / "link.jpg").symlink_to(root / "b.png")
+        huge = root / "huge.png"
+        huge.write_bytes(b"h")
+        os.truncate(huge, 64 * 1024 * 1024 + 1)
+
+        with self.assertRaises(FileNotFoundError):
+            gallery.scan_directory(root / "missing")
+        with self.assertRaises(NotADirectoryError):
+            gallery.scan_directory(self.path)
+
+        items = gallery.scan_directory(root)
+        self.assertEqual([i["title"] for i in items], ["A.PNG", "b.png", "link.jpg"])
+        self.assertTrue(all(i["cached_path"] is None and i["caption"] == "" for i in items))
+        self.assertEqual(items[0]["path"], str(root / "A.PNG"))
+        self.assertEqual(gallery.scan_directory(root, recursive=True)[-1]["title"], "nested/z.png")
+        self.assertEqual([i["title"] for i in gallery.scan_directory(root, recursive=True, limit=2)],
+                         ["A.PNG", "b.png"])
+
+    def test_cli_browse_writes_state_refuses_file_and_skips_open(self):
+        album = Path(self.temp.name) / "album"
+        album.mkdir()
+        (album / "shot.png").write_bytes(b"png")
+        with patch.object(gallery, "open_pane") as opener, patch("sys.stdout", new=io.StringIO()) as out:
+            with patch.object(sys, "argv", [gallery.__file__, "browse", str(album), "--no-open"]):
+                self.assertEqual(gallery.main(), 0)
+            opener.assert_not_called()
+            payload = json.loads(out.getvalue())
+        self.assertEqual(payload["directory"], str(album.resolve()))
+        self.assertFalse(payload["recursive"])
+        self.assertEqual(gallery.get(self.db, "browse_dir"), str(album.resolve()))
+        self.assertTrue(gallery.get(self.db, "browse_request"))
+        self.assertEqual(gallery.get(self.db, "browse_recursive"), "")
+
+        with patch.object(gallery, "open_pane") as opener, patch("sys.stdout", new=io.StringIO()):
+            with patch.object(sys, "argv", [gallery.__file__, "browse", str(album), "--recursive", "--no-open"]):
+                self.assertEqual(gallery.main(), 0)
+            opener.assert_not_called()
+        self.assertEqual(gallery.get(self.db, "browse_recursive"), "1")
+
+        result = subprocess.run([sys.executable, gallery.__file__, "browse", str(self.path), "--no-open"],
+                                capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"Not a directory", result.stderr)
+
+    def test_tui_directory_browse_live_hold_and_copy(self):
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+        png += chunk(b"IDAT", zlib.compress(b"\0\xff\0\0\0\xff\0" * 2)) + chunk(b"IEND", b"")
+        album = Path(self.temp.name) / "album"
+        nested = album / "nested"
+        nested.mkdir(parents=True)
+        first = album / "a.png"
+        later = album / "b.png"
+        nested_image = nested / "z.png"
+        first.write_bytes(png)
+        later.write_bytes(png)
+        nested_image.write_bytes(png)
+        live = Path(self.temp.name) / "live.png"
+        held = Path(self.temp.name) / "held.png"
+        live.write_bytes(png)
+        held.write_bytes(png)
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 99, 792, 448))
+        env = dict(os.environ)
+        env.pop("HERDR_GALLERY_RESUME", None)
+        copied = Path(self.temp.name) / "copied.jsonl"
+        bootstrap = """
+import json, gallery
+def copy_image(item):
+    with open(%r, 'a') as log:
+        log.write(json.dumps(dict(item)) + '\\n')
+gallery.copy_image = copy_image
+gallery.gallery(gallery.connect())
+""" % str(copied)
+
+        def start():
+            return subprocess.Popen([sys.executable, "-c", bootstrap], stdin=slave, stdout=slave, stderr=slave, env=env)
+
+        output = bytearray()
+
+        def wait_for(proc, predicate):
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.02)[0]:
+                    output.extend(os.read(master, 65536))
+                if predicate():
+                    return
+                if proc.poll() is not None:
+                    self.fail("Viewer exited unexpectedly: %s" % proc.returncode)
+            self.fail("Viewer state timed out")
+
+        def state():
+            return json.loads(gallery.get(self.db, "view_state", "{}"))
+
+        proc = start()
+        try:
+            wait_for(proc, lambda: gallery.get(self.db, "heartbeat") not in ("", "0"))
+            os.write(master, b"d")
+            wait_for(proc, lambda: state().get("browsing") is True)
+            os.write(master, b"\x1b")
+            wait_for(proc, lambda: state().get("browsing") is False)
+            self.assertEqual(state().get("source") or "", "")
+            self.assertIsNone(proc.poll(), "Escape must not close the gallery")
+            os.write(master, b"d" + str(album).encode() + b"\r")
+            wait_for(proc, lambda: state().get("source") == str(album.resolve()))
+            self.assertEqual(state().get("path"), str(first))
+            self.assertFalse(state().get("recursive"))
+            os.write(master, b"r")
+            wait_for(proc, lambda: state().get("recursive") is True)
+            os.write(master, b"c")
+            wait_for(proc, lambda: copied.is_file() and copied.read_text().strip())
+            self.assertEqual(json.loads(copied.read_text().splitlines()[0])["path"], str(first))
+            gallery.publish(self.db, live, "Live")
+            wait_for(proc, lambda: state().get("source") == "" and state().get("path") == str(live.resolve()))
+            os.write(master, b"d\r")
+            wait_for(proc, lambda: state().get("source") == str(album.resolve()))
+            os.write(master, b"a")
+            wait_for(proc, lambda: state().get("paused") is True)
+            gallery.publish(self.db, held, "Held")
+            beat = float(gallery.get(self.db, "heartbeat") or 0)
+            wait_for(proc, lambda: float(gallery.get(self.db, "heartbeat") or 0) != beat)
+            self.assertEqual(state().get("source"), str(album.resolve()))
+            os.write(master, b"q")
+            wait_for(proc, lambda: proc.poll() is not None)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    wait_for(proc, lambda: proc.poll() is not None)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+
     def test_missing_image_does_not_replace_selection(self):
         token = gallery.publish(self.db, self.path)
         with self.assertRaises(FileNotFoundError):

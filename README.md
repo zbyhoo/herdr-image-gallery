@@ -102,7 +102,9 @@ Focus the gallery pane to use these keys.
 | c | Copy the selected image to the system clipboard at full resolution |
 | PgUp / PgDn | Change thumbnail pages |
 | / | Filter titles and paths |
-| Esc | Finish filtering or return to thumbnails; never closes the gallery |
+| d | Browse every supported image in a directory |
+| r | Toggle recursive listing while a directory is shown |
+| Esc | Finish filtering, cancel directory prompt, or return to thumbnails; never closes the gallery |
 | a | Toggle LIVE / HOLD |
 | f | Toggle fullscreen for the gallery pane |
 | s | Set up Codex / Claude Code |
@@ -110,12 +112,22 @@ Focus the gallery pane to use these keys.
 
 **LIVE** follows newly published images. **HOLD** keeps your current selection; switching back to LIVE displays the latest pending image.
 
-Press **c** in either thumbnails or preview to copy the selected image, then paste it into an app that accepts images. Copying preserves full resolution and transparency, uses the archived image even if the original file is gone, and displays a confirmation or error in the footer. Animated images copy as a static frame. While editing a filter, `c` types into the filter; in agent setup, it selects Codex.
+Press **c** in either thumbnails or preview to copy the selected image, then paste it into an app that accepts images. Copying preserves full resolution and transparency, uses the archived image even if the original file is gone, and displays a confirmation or error in the footer. Animated images copy as a static frame. While editing a filter or directory path, `c` types into the prompt; in agent setup, it selects Codex.
 
 To reopen the gallery:
 
 ```sh
 herdr plugin action invoke local.image-gallery.open
+```
+
+## Browse a directory
+
+Press **d** and enter a directory path (`~` is expanded) to list every supported image in that folder, not only images an agent published. Enter with an empty path to return to history; Esc cancels the prompt without closing the gallery. **r** includes subdirectories. Directory images are not copied into history; **c** copies from the original file. In LIVE, a newly published image returns to history; HOLD keeps the directory view.
+
+From the CLI:
+
+```sh
+python3 gallery.py browse /absolute/path/to/folder --recursive
 ```
 
 ## Send images from scripts or the command line
@@ -142,6 +154,9 @@ Without the skill, run `gallery.py` directly from the plugin directory. Locate t
 | `show PATH` | Publish an image and open the gallery if needed |
 | `show PATH --no-open` | Queue an image without opening a pane |
 | `show PATH --wait 10` | Wait up to 10 seconds for delivery status |
+| `browse DIR` | Browse all supported images in a directory |
+| `browse DIR --recursive` | Include subdirectories |
+| `browse DIR --no-open` | Queue a directory browse without opening a pane |
 | `open` | Open or reuse the gallery |
 | `list` | Print image history as JSON |
 | `status` | Print viewer state and diagnostics as JSON |

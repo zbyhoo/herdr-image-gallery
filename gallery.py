@@ -89,6 +89,50 @@ def image_path(value):
     return p
 
 
+def scan_directory(directory, recursive=False, limit=2000):
+    root = Path(directory).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise NotADirectoryError("Not a directory: " + str(root))
+    found, stack, seen = [], [(root, True)], set()
+    while stack:
+        current, is_root = stack.pop()
+        real = os.path.realpath(current)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            entries = os.scandir(current)
+        except PermissionError:
+            if is_root:
+                raise
+            continue
+        except OSError:
+            if is_root:
+                raise
+            continue
+        with entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        if recursive:
+                            stack.append((entry.path, False))
+                        continue
+                    if not entry.is_file(follow_symlinks=True):
+                        continue
+                    st = entry.stat(follow_symlinks=True)
+                except OSError:
+                    continue
+                if Path(entry.name).suffix.lower() not in EXTENSIONS or st.st_size > 64 * 1024 * 1024:
+                    continue
+                rel = Path(entry.path).relative_to(root).as_posix()
+                found.append({"path": str(Path(entry.path)), "title": rel, "caption": "",
+                              "updated": st.st_mtime, "cached_path": None})
+    found.sort(key=lambda item: item["title"].casefold())
+    return found[:limit]
+
+
 def archive(db, path):
     directory = Path(db.execute("PRAGMA database_list").fetchone()[2]).parent / "images"
     directory.mkdir(exist_ok=True, mode=0o700)
@@ -464,7 +508,7 @@ def gallery_heading(label, paused):
     return "IMAGE GALLERY  |  " + label + "  |  " + ("HOLD" if paused else "LIVE")
 
 
-def draw(items, index, query, searching, paused, cache, mode="preview"):
+def draw(items, index, query, searching, paused, cache, mode="preview", source="", browsing=False, browse_input="", recursive=False):
     cols, rows, cw, ch = terminal_size()
     prepared = None
     if mode == "preview" and items:
@@ -490,19 +534,39 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
     def line(row, text, color="37"):
         sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[%sm%s\x1b[0m" % (row, color, clean(text)[:cols - 1]))
 
+    def status(default):
+        if browsing:
+            return "d " + browse_input
+        if searching:
+            return "/ " + query
+        if source:
+            return "DIR: %s (%d images%s)" % (source, len(items), ", recursive" if recursive else "")
+        return default
+
     line(1, gallery_heading(cache.get("workspace_label", os.environ["HERDR_WORKSPACE_ID"]), paused), "1;36")
     line(2, "c: copy image  Tab: thumbnails  arrows: select  Enter: open  /: filter  a: live/hold  f: zoom  q: close", "90")
     if not items:
-        line(4, "Waiting for an agent to send an image." if not query else "No matching images.")
-        line(rows, "/ " + query if searching else "CLI: gallery.py show /absolute/path/image.png")
+        if query:
+            empty = "No matching images."
+        elif source:
+            empty = "No images in this directory."
+        else:
+            empty = "Waiting for an agent to send an image."
+        line(4, empty)
+        line(rows, status("CLI: gallery.py show /absolute/path/image.png"))
         sys.stdout.flush()
         return ""
     item = items[index]
     if mode == "grid":
         columns, grid_rows, page_size, start = grid_geometry(cols, rows, len(items), index)
         cell_cols, cell_rows = (cols - 2) // columns, max(1, (rows - 7) // grid_rows)
-        line(3, "THUMBNAILS  %d/%d  |  page %d/%d" % (index + 1, len(items), start // page_size + 1,
-                                                        (len(items) + page_size - 1) // page_size), "1;37")
+        pages = "THUMBNAILS  %d/%d  |  page %d/%d" % (index + 1, len(items), start // page_size + 1,
+                                                      (len(items) + page_size - 1) // page_size)
+        if source:
+            pages = "THUMBNAILS  %d/%d  |  %s  |  page %d/%d" % (
+                index + 1, len(items), source, start // page_size + 1,
+                (len(items) + page_size - 1) // page_size)
+        line(3, pages, "1;37")
         for slot, thumb in enumerate(items[start:start + page_size]):
             x, y = 2 + slot % columns * cell_cols, 5 + slot // columns * cell_rows
             active = start + slot == index
@@ -523,10 +587,13 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                 sys.stdout.write("\x1b[%d;%dH\x1b[31mMissing image\x1b[0m" % (y + 2, x))
         line(rows - 1, item["title"], "36")
-        line(rows, "/ " + query if searching else "Arrows: select  Enter/click: open  Tab: switch view  PgUp/PgDn: pages", "90")
+        line(rows, status("Arrows: select  Enter/click: open  Tab: switch view  PgUp/PgDn: pages"), "90")
         sys.stdout.flush()
         return ""
-    line(3, "%d/%d  %s" % (index + 1, len(items), item["title"]), "1;37")
+    heading = "%d/%d  %s" % (index + 1, len(items), item["title"])
+    if source:
+        heading = "%d/%d  %s  |  %s" % (index + 1, len(items), item["title"], source)
+    line(3, heading, "1;37")
     error = ""
     try:
         path = display_path(item)
@@ -547,7 +614,7 @@ def draw(items, index, query, searching, paused, cache, mode="preview"):
         line(6, "Cannot display: " + error, "31")
     line(rows - 3, item["caption"], "37")
     line(rows - 2, item["path"], "90")
-    line(rows, "/ " + query if searching else "LIVE: new agent images appear automatically.  s: agent setup", "36")
+    line(rows, status("LIVE: new agent images appear automatically.  s: agent setup"), "36")
     sys.stdout.flush()
     return error
 
@@ -671,6 +738,10 @@ def gallery(db):
     searching = paused = False
     paused = resume.get("paused", False)
     mode = resume.get("mode", "preview")
+    source, recursive = resume.get("source", "") or "", bool(resume.get("recursive", False))
+    last_browse_request = resume.get("browse_request", "")
+    browsing, browse_input = False, ""
+    last_scan, last_scan_key, scanned_items, scan_error = 0, None, [], ""
     cache, previous, heartbeat = {}, None, 0
     setup = any(agent_skill_status(a) != "installed" for a in (detected_agents() or list(AGENTS))) and not get(db, "codex_setup_dismissed")
     setup_message = ""
@@ -709,24 +780,56 @@ def gallery(db):
                     sys.stdout.write("\x1b[1;1H\x1b[2K\x1b[1;36m" + heading + "\x1b[0m")
                     sys.stdout.flush()
             request = get(db, "request")
-            if request != last_request and not paused:
+            new_image = request != last_request and not paused
+            if new_image:
                 selected, query = get(db, "requested_path"), ""
                 searching, last_request, mode = False, request, "preview"
-            items = [r for r in db.execute("SELECT * FROM images ORDER BY id")
+                source, browsing = "", False
+                last_browse_request = get(db, "browse_request")
+            browse_req = get(db, "browse_request")
+            if not new_image and browse_req != last_browse_request and not paused:
+                last_browse_request = browse_req
+                source = get(db, "browse_dir")
+                recursive = get(db, "browse_recursive") == "1"
+                selected, query, searching, browsing, mode = "", "", False, False, "preview"
+                last_scan_key = None
+            if source:
+                now = time.monotonic()
+                scan_key = (source, recursive)
+                if scan_key != last_scan_key or now - last_scan >= 2:
+                    try:
+                        scanned_items = scan_directory(source, recursive)
+                        last_scan, last_scan_key, scan_error = now, scan_key, ""
+                    except (OSError, ValueError) as exc:
+                        scan_error = str(exc)
+                        source, scanned_items, last_scan_key = "", [], None
+            history = source == ""
+            raw_items = list(db.execute("SELECT * FROM images ORDER BY id")) if history else scanned_items
+            items = [r for r in raw_items
                      if query.casefold() in (r["title"] + " " + r["path"]).casefold()]
             index = next((i for i, r in enumerate(items) if r["path"] == selected), 0)
             if items:
                 selected = items[index]["path"]
-            state = ([(r["path"], r["updated"]) for r in items], index, query, searching, paused, terminal_size(), last_request, mode, setup, setup_message)
+            state = ([(r["path"], r["updated"]) for r in items], index, query, searching, paused, terminal_size(),
+                     last_request, mode, setup, setup_message, source, recursive, browsing, browse_input, last_browse_request)
             if resize_refresh.due(state[5]):
                 # Grid selection caching must not suppress host-surface restoration.
                 cache.pop("grid_signature", None)
                 previous = None
             if state != previous:
-                error = draw(items, index, query, searching, paused, cache, mode)
+                error = draw(items, index, query, searching, paused, cache, mode,
+                             source, browsing, browse_input, recursive)
+                if scan_error:
+                    error = "Cannot browse: " + scan_error
+                    cols, rows = terminal_size()[:2]
+                    sys.stdout.write("\x1b[%d;1H\x1b[2K\x1b[31m%s\x1b[0m" % (rows, clean(error)[:cols - 1]))
+                    sys.stdout.flush()
+                    scan_error = ""
                 put(db, displayed_path=selected, rendered_request=last_request, error=error,
                     preview_metrics=cache.get("metrics", ""),
-                    view_state=json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused, "mode": mode}))
+                    view_state=json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused,
+                                           "mode": mode, "source": source, "recursive": recursive,
+                                           "browse_request": last_browse_request, "browsing": browsing}))
                 if native_graphics():
                     put(db, terminal_reply="OK" if not error else error, terminal_request=last_request,
                         acknowledgement="herdr-stream-submitted")
@@ -785,6 +888,29 @@ def gallery(db):
                 elif key.isprintable():
                     query += key
                 continue
+            if browsing:
+                if key in ("\r", "\n"):
+                    browsing = False
+                    typed = browse_input.strip()
+                    if not typed:
+                        source, selected, last_scan_key = "", "", None
+                    else:
+                        try:
+                            directory = Path(typed).expanduser().resolve(strict=True)
+                            if not directory.is_dir():
+                                raise NotADirectoryError("Not a directory: " + str(directory))
+                            source, selected, last_scan_key = str(directory), "", None
+                            put(db, browse_dir=source)
+                        except (OSError, ValueError) as exc:
+                            scan_error = str(exc)
+                            source, selected, last_scan_key = "", "", None
+                elif key == "\x1b":
+                    browsing = False
+                elif key in ("\x7f", "\b"):
+                    browse_input = browse_input[:-1]
+                elif key.isprintable():
+                    browse_input += key
+                continue
             if key == "\x1b":
                 mode = "grid"
                 continue
@@ -800,10 +926,17 @@ def gallery(db):
                 mode = "preview"
             elif key == "/":
                 searching, query = True, ""
+            elif key == "d":
+                browsing, browse_input = True, source or get(db, "browse_dir")
+            elif key == "r" and source:
+                recursive = not recursive
+                last_scan_key = None
+                put(db, browse_recursive="1" if recursive else "")
             elif key == "a":
                 paused = not paused
                 if not paused:
                     last_request = ""
+                    last_browse_request = ""
             elif key == "f":
                 try:
                     herdr("pane", "zoom", "--current", "--toggle")
@@ -827,18 +960,19 @@ def gallery(db):
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     if reload_source:
-        os.environ["HERDR_GALLERY_RESUME"] = json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused, "mode": mode})
+        os.environ["HERDR_GALLERY_RESUME"] = json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused, "mode": mode, "source": source, "recursive": recursive, "browse_request": last_browse_request})
         db.close()
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="view", choices=["view", "show", "open", "list", "status", "link", "setup-codex", "setup-claude", "setup-agents", "agent-status", "auto-setup"])
+    parser.add_argument("command", nargs="?", default="view", choices=["view", "show", "open", "list", "status", "link", "browse", "setup-codex", "setup-claude", "setup-agents", "agent-status", "auto-setup"])
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--title", default="")
     parser.add_argument("--caption", default="")
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--open", action="store_true", dest="open_action")
     parser.add_argument("--agent", choices=["auto", "both", "codex", "claude"], default="auto")
     parser.add_argument("--yes", action="store_true", help="Register bundled agent skills without prompting")
@@ -863,7 +997,7 @@ def main():
         results = setup_agents(selection)
         print(json.dumps(results))
         return 1 if any(r["status"] == "error" for r in results.values()) else 0
-    if args.command in ("view", "open", "show", "link") or args.open_action:
+    if args.command in ("view", "open", "show", "link", "browse") or args.open_action:
         results = auto_setup_agents()
         for agent, result in results.items():
             if result["status"] == "error":
@@ -899,6 +1033,20 @@ def main():
                               "error": error, "workspace": os.environ["HERDR_WORKSPACE_ID"]}))
             if args.wait and (not rendered or get(db, "error")):
                 return 2
+        elif args.command == "browse":
+            if not args.paths:
+                parser.error("browse requires a directory")
+            directory = Path(args.paths[0]).expanduser().resolve(strict=True)
+            if not directory.is_dir():
+                raise ValueError("Not a directory: " + str(directory))
+            token = str(time.time_ns())
+            put(db, browse_dir=str(directory), browse_recursive="1" if args.recursive else "",
+                browse_request=token)
+            if not args.no_open:
+                open_pane(db)
+            print(json.dumps({"browse_request": token, "directory": str(directory),
+                              "recursive": bool(args.recursive),
+                              "workspace": os.environ["HERDR_WORKSPACE_ID"]}))
         elif args.command == "list":
             print(json.dumps([dict(r) for r in db.execute("SELECT * FROM images ORDER BY id")]))
         elif args.command == "status":

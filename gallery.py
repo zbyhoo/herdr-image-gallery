@@ -108,7 +108,7 @@ SCAN_TIME_BUDGET = 1.0
 SCAN_ENTRY_BUDGET = 100_000
 
 
-def scan_directory(directory, recursive=False, limit=2000,
+def scan_directory(directory, recursive=False, limit=2000, sort="name",
                     time_budget=SCAN_TIME_BUDGET, entry_budget=SCAN_ENTRY_BUDGET):
     root = Path(directory).expanduser().resolve(strict=True)
     if not root.is_dir():
@@ -154,7 +154,10 @@ def scan_directory(directory, recursive=False, limit=2000,
                 rel = Path(entry.path).relative_to(root).as_posix()
                 found.append({"path": str(Path(entry.path)), "title": rel, "caption": "",
                               "updated": st.st_mtime, "cached_path": None})
-    found.sort(key=lambda item: item["title"].casefold())
+    if sort == "newest":
+        found.sort(key=lambda item: item["updated"], reverse=True)
+    else:
+        found.sort(key=lambda item: item["title"].casefold())
     limited = limited or len(found) > limit
     return ScanResult(found[:limit], limited)
 
@@ -535,7 +538,7 @@ def gallery_heading(label, paused):
 
 
 def draw(items, index, query, searching, paused, cache, mode="preview", source="", browsing=False,
-         browse_input="", recursive=False, scanning=False, limited=False):
+         browse_input="", recursive=False, scanning=False, limited=False, sort="name"):
     cols, rows, cw, ch = terminal_size()
     prepared = None
     if mode == "preview" and items:
@@ -570,7 +573,8 @@ def draw(items, index, query, searching, paused, cache, mode="preview", source="
             if scanning and not items:
                 return "DIR: %s (scanning...)" % source
             count = "%d+ images, limited" % len(items) if limited else "%d images" % len(items)
-            return "DIR: %s (%s%s)" % (source, count, ", recursive" if recursive else "")
+            suffix = ("%s%s" % (", recursive" if recursive else "", ", newest" if sort == "newest" else ""))
+            return "DIR: %s (%s%s)" % (source, count, suffix)
         return default
 
     line(1, gallery_heading(cache.get("workspace_label", os.environ["HERDR_WORKSPACE_ID"]), paused), "1;36")
@@ -771,6 +775,7 @@ def gallery(db):
     paused = resume.get("paused", False)
     mode = resume.get("mode", "preview")
     source, recursive = resume.get("source", "") or "", bool(resume.get("recursive", False))
+    sort = resume.get("sort", "name") if resume.get("sort") in ("name", "newest") else "name"
     last_browse_request = resume.get("browse_request", "")
     browsing, browse_input = False, ""
     last_scan, last_scan_key, scanned_items, scan_error = 0, None, [], ""
@@ -831,16 +836,16 @@ def gallery(db):
                 last_scan_key, scan_future = None, None
             if source:
                 now = time.monotonic()
-                scan_key = (source, recursive)
+                scan_key = (source, recursive, sort)
                 if scan_key != last_scan_key:
-                    # A new source/recursion setting discards any in-flight scan's result
+                    # A new source/recursion/sort setting discards any in-flight scan's result
                     # (checked via scan_pending_key below) and shows "scanning..." until it lands.
                     last_scan_key = scan_key
                     scanned_items, scan_limited, scanning, scan_future = [], False, True, None
                     last_scan, scan_interval = 0, 2
                 if scan_future is None and now - last_scan >= scan_interval:
                     scan_pending_key, scan_started = scan_key, now
-                    scan_future = scan_executor.submit(scan_directory, source, recursive)
+                    scan_future = scan_executor.submit(scan_directory, source, recursive, sort=sort)
                 if scan_future is not None and scan_future.done():
                     future, scan_future = scan_future, None
                     try:
@@ -865,14 +870,14 @@ def gallery(db):
                 selected = items[index]["path"]
             state = ([(r["path"], r["updated"]) for r in items], index, query, searching, paused, terminal_size(),
                      last_request, mode, setup, setup_message, source, recursive, browsing, browse_input,
-                     last_browse_request, scanning, scan_limited)
+                     last_browse_request, scanning, scan_limited, sort)
             if resize_refresh.due(state[5]):
                 # Grid selection caching must not suppress host-surface restoration.
                 cache.pop("grid_signature", None)
                 previous = None
             if state != previous:
                 error = draw(items, index, query, searching, paused, cache, mode,
-                             source, browsing, browse_input, recursive, scanning, scan_limited)
+                             source, browsing, browse_input, recursive, scanning, scan_limited, sort)
                 if scan_error:
                     error = "Cannot browse: " + scan_error
                     cols, rows = terminal_size()[:2]
@@ -882,7 +887,7 @@ def gallery(db):
                 put(db, displayed_path=selected, rendered_request=last_request, error=error,
                     preview_metrics=cache.get("metrics", ""),
                     view_state=json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused,
-                                           "mode": mode, "source": source, "recursive": recursive,
+                                           "mode": mode, "source": source, "recursive": recursive, "sort": sort,
                                            "browse_request": last_browse_request, "browsing": browsing,
                                            "scanning": scanning, "limited": scan_limited}))
                 if native_graphics():
@@ -987,6 +992,9 @@ def gallery(db):
                 recursive = not recursive
                 last_scan_key = None
                 put(db, browse_recursive="1" if recursive else "")
+            elif key == "o" and source:
+                sort = "newest" if sort == "name" else "name"
+                last_scan_key = None
             elif key == "a":
                 paused = not paused
                 if not paused:
@@ -1016,7 +1024,7 @@ def gallery(db):
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     if reload_source:
-        os.environ["HERDR_GALLERY_RESUME"] = json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused, "mode": mode, "source": source, "recursive": recursive, "browse_request": last_browse_request})
+        os.environ["HERDR_GALLERY_RESUME"] = json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused, "mode": mode, "source": source, "recursive": recursive, "sort": sort, "browse_request": last_browse_request})
         db.close()
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
 

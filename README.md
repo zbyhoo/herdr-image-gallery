@@ -106,6 +106,7 @@ Focus the gallery pane to use these keys.
 | / | Filter titles and paths |
 | d | Browse every supported image in a directory |
 | r | Toggle recursive listing while a directory is shown |
+| o | Toggle directory sort between name (A-Z) and newest first |
 | Esc | Finish filtering, cancel directory prompt, or return to thumbnails; never closes the gallery |
 | a | Toggle LIVE / HOLD |
 | f | Toggle fullscreen for the gallery pane |
@@ -124,7 +125,7 @@ herdr plugin action invoke local.image-gallery.open
 
 ## Browse a directory
 
-Press **d** and enter a directory path (`~` is expanded) to list every supported image in that folder, not only images an agent published. Enter with an empty path to return to history; Esc cancels the prompt without closing the gallery. **r** includes subdirectories. Directory images are not copied into history; **c** copies from the original file. In LIVE, a newly published image returns to history; HOLD keeps the directory view.
+Press **d** and enter a directory path (`~` is expanded) to list every supported image in that folder, not only images an agent published. Enter with an empty path to return to history; Esc cancels the prompt without closing the gallery. **r** includes subdirectories. **o** toggles the sort order between name (A-Z, the default) and newest first; the footer shows `newest` when that mode is active. Directory images are not copied into history; **c** copies from the original file. In LIVE, a newly published image returns to history; HOLD keeps the directory view.
 
 Scanning runs in the background, so the pane keeps responding to keys and redrawing while a large directory is read. The footer shows `scanning...` while the first listing of a new directory is in progress, and `2000+ images, limited` when a directory has more supported images than fit, or `r` on a very large tree (such as `~` or `/`) stops walking after a bounded time/entry budget. A plain folder is rescanned every couple of seconds so newly added images still show up automatically; that interval grows for large or recursive directories so they are not rewalked on every tick.
 

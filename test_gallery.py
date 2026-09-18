@@ -548,6 +548,23 @@ gallery.gallery(gallery.connect())
         self.assertEqual([i["title"] for i in gallery.scan_directory(root, recursive=True, limit=2)],
                          ["A.PNG", "b.png"])
 
+    def test_scan_directory_newest_sort_keeps_the_newest_entries_under_the_cap(self):
+        root = Path(self.temp.name) / "byage"
+        root.mkdir()
+        now = time.time()
+        # Alphabetical order is a,b,c,d; mtime order (newest first) is d,c,b,a - the reverse.
+        names = ["a.png", "b.png", "c.png", "d.png"]
+        for offset, name in enumerate(reversed(names)):
+            path = root / name
+            path.write_bytes(b"x")
+            os.utime(path, (now - offset, now - offset))
+        newest_first = gallery.scan_directory(root, sort="newest")
+        self.assertEqual([i["title"] for i in newest_first], ["d.png", "c.png", "b.png", "a.png"])
+        capped = gallery.scan_directory(root, sort="newest", limit=2)
+        self.assertEqual([i["title"] for i in capped], ["d.png", "c.png"])
+        name_sorted = gallery.scan_directory(root, sort="name", limit=2)
+        self.assertEqual([i["title"] for i in name_sorted], ["a.png", "b.png"])
+
     def test_cli_browse_writes_state_refuses_file_and_skips_open(self):
         album = Path(self.temp.name) / "album"
         album.mkdir()
@@ -820,6 +837,79 @@ gallery.gallery(gallery.connect())
             gallery.draw([], 0, "", False, False, {}, mode="preview", source="/some/big/dir",
                          recursive=False, scanning=True, limited=False)
             self.assertIn("scanning", out.getvalue())
+        with patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            gallery.draw(items, 0, "", False, False, {}, mode="grid", source="/some/big/dir",
+                         recursive=False, scanning=False, limited=False, sort="newest")
+            self.assertIn("newest", out.getvalue())
+        with patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            gallery.draw(items, 0, "", False, False, {}, mode="grid", source="/some/big/dir",
+                         recursive=False, scanning=False, limited=False, sort="name")
+            self.assertNotIn("newest", out.getvalue())
+
+    def test_tui_directory_sort_toggle_switches_order_and_persists(self):
+        album = Path(self.temp.name) / "sortalbum"
+        album.mkdir()
+        now = time.time()
+        older = album / "a.png"
+        newer = album / "z.png"
+        older.write_bytes(b"a")
+        newer.write_bytes(b"z")
+        os.utime(older, (now - 100, now - 100))
+        os.utime(newer, (now, now))
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 99, 792, 448))
+        env = dict(os.environ)
+        env.pop("HERDR_GALLERY_RESUME", None)
+        bootstrap = "import gallery\ngallery.gallery(gallery.connect())\n"
+
+        def start():
+            return subprocess.Popen([sys.executable, "-c", bootstrap], stdin=slave, stdout=slave, stderr=slave, env=env)
+
+        output = bytearray()
+
+        def wait_for(proc, predicate, timeout=8):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.02)[0]:
+                    output.extend(os.read(master, 65536))
+                if predicate():
+                    return
+                if proc.poll() is not None:
+                    self.fail("Viewer exited unexpectedly: %s" % proc.returncode)
+            self.fail("Viewer state timed out")
+
+        def state():
+            return json.loads(gallery.get(self.db, "view_state", "{}"))
+
+        proc = start()
+        try:
+            wait_for(proc, lambda: gallery.get(self.db, "heartbeat") not in ("", "0"))
+            os.write(master, b"d" + str(album).encode() + b"\r")
+            wait_for(proc, lambda: state().get("source") == str(album.resolve())
+                     and state().get("path") == str(older.resolve()))
+            self.assertEqual(state().get("sort") or "name", "name")
+            os.write(master, b"o")
+            # The current selection is preserved by path across a re-sort; only ordering changes.
+            wait_for(proc, lambda: state().get("sort") == "newest")
+            self.assertEqual(state().get("path"), str(older.resolve()))
+            os.write(master, b"o")
+            wait_for(proc, lambda: state().get("sort") == "name")
+            self.assertEqual(state().get("path"), str(older.resolve()))
+            os.write(master, b"q")
+            wait_for(proc, lambda: proc.poll() is not None)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    wait_for(proc, lambda: proc.poll() is not None)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
 
     def test_scan_directory_stops_within_time_and_entry_budget_and_reports_limited(self):
         root = Path(self.temp.name) / "huge"

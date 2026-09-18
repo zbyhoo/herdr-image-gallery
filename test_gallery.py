@@ -635,11 +635,11 @@ gallery.gallery(gallery.connect())
             self.assertEqual(state().get("source") or "", "")
             self.assertIsNone(proc.poll(), "Escape must not close the gallery")
             os.write(master, b"d" + str(album).encode() + b"\r")
-            wait_for(proc, lambda: state().get("source") == str(album.resolve()))
-            self.assertEqual(state().get("path"), str(first))
+            wait_for(proc, lambda: state().get("source") == str(album.resolve())
+                     and state().get("path") == str(first))
             self.assertFalse(state().get("recursive"))
             os.write(master, b"r")
-            wait_for(proc, lambda: state().get("recursive") is True)
+            wait_for(proc, lambda: state().get("recursive") is True and state().get("scanning") is False)
             os.write(master, b"c")
             wait_for(proc, lambda: copied.is_file() and copied.read_text().strip())
             self.assertEqual(json.loads(copied.read_text().splitlines()[0])["path"], str(first))
@@ -666,6 +666,173 @@ gallery.gallery(gallery.connect())
                         proc.wait(timeout=5)
             os.close(master)
             os.close(slave)
+
+    def test_directory_scan_runs_in_background_without_blocking_input(self):
+        album = Path(self.temp.name) / "slowalbum"
+        album.mkdir()
+        (album / "a.png").write_bytes(b"a")
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 99, 792, 448))
+        env = dict(os.environ)
+        env.pop("HERDR_GALLERY_RESUME", None)
+        bootstrap = """
+import time, gallery
+_real_scan_directory = gallery.scan_directory
+def slow_scan_directory(*args, **kwargs):
+    time.sleep(1.0)
+    return _real_scan_directory(*args, **kwargs)
+gallery.scan_directory = slow_scan_directory
+gallery.gallery(gallery.connect())
+"""
+
+        def start():
+            return subprocess.Popen([sys.executable, "-c", bootstrap], stdin=slave, stdout=slave, stderr=slave, env=env)
+
+        output = bytearray()
+
+        def wait_for(proc, predicate, timeout=8):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.02)[0]:
+                    output.extend(os.read(master, 65536))
+                if predicate():
+                    return
+                if proc.poll() is not None:
+                    self.fail("Viewer exited unexpectedly: %s" % proc.returncode)
+            self.fail("Viewer state timed out")
+
+        def state():
+            return json.loads(gallery.get(self.db, "view_state", "{}"))
+
+        proc = start()
+        try:
+            wait_for(proc, lambda: gallery.get(self.db, "heartbeat") not in ("", "0"))
+            os.write(master, b"d" + str(album).encode() + b"\r")
+            wait_for(proc, lambda: state().get("source") == str(album.resolve()) and state().get("scanning") is True)
+            started = time.monotonic()
+            os.write(master, b"a")
+            wait_for(proc, lambda: state().get("paused") is True, timeout=0.6)
+            self.assertLess(time.monotonic() - started, 0.9,
+                             "key handling must not wait on the slow background scan")
+            wait_for(proc, lambda: state().get("scanning") is False)
+            os.write(master, b"q")
+            wait_for(proc, lambda: proc.poll() is not None)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    wait_for(proc, lambda: proc.poll() is not None)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+
+    def test_stale_scan_results_are_dropped_after_source_change(self):
+        slow_dir = Path(self.temp.name) / "slow"
+        fast_dir = Path(self.temp.name) / "fast"
+        slow_dir.mkdir()
+        fast_dir.mkdir()
+        (slow_dir / "a.png").write_bytes(b"a")
+        fast_image = fast_dir / "b.png"
+        fast_image.write_bytes(b"b")
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 28, 99, 792, 448))
+        env = dict(os.environ)
+        env.pop("HERDR_GALLERY_RESUME", None)
+        bootstrap = """
+import time, gallery
+_real_scan_directory = gallery.scan_directory
+def delayed_scan_directory(directory, *args, **kwargs):
+    if str(directory).endswith("slow"):
+        time.sleep(0.6)
+    return _real_scan_directory(directory, *args, **kwargs)
+gallery.scan_directory = delayed_scan_directory
+gallery.gallery(gallery.connect())
+"""
+
+        def start():
+            return subprocess.Popen([sys.executable, "-c", bootstrap], stdin=slave, stdout=slave, stderr=slave, env=env)
+
+        output = bytearray()
+
+        def wait_for(proc, predicate, timeout=8):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.02)[0]:
+                    output.extend(os.read(master, 65536))
+                if predicate():
+                    return
+                if proc.poll() is not None:
+                    self.fail("Viewer exited unexpectedly: %s" % proc.returncode)
+            self.fail("Viewer state timed out")
+
+        def state():
+            return json.loads(gallery.get(self.db, "view_state", "{}"))
+
+        proc = start()
+        try:
+            wait_for(proc, lambda: gallery.get(self.db, "heartbeat") not in ("", "0"))
+            os.write(master, b"d" + str(slow_dir).encode() + b"\r")
+            wait_for(proc, lambda: state().get("source") == str(slow_dir.resolve()) and state().get("scanning") is True)
+            clear = b"\x7f" * len(str(slow_dir.resolve()))
+            os.write(master, b"d" + clear + str(fast_dir).encode() + b"\r")
+            wait_for(proc, lambda: state().get("source") == str(fast_dir.resolve())
+                     and state().get("path") == str(fast_image.resolve()))
+            # The slow scan for the old source finishes well after this point; its result
+            # must never overwrite the directory the user has since switched to.
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.02)[0]:
+                    output.extend(os.read(master, 65536))
+                self.assertEqual(state().get("source"), str(fast_dir.resolve()))
+                self.assertEqual(state().get("path"), str(fast_image.resolve()))
+            os.write(master, b"q")
+            wait_for(proc, lambda: proc.poll() is not None)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    wait_for(proc, lambda: proc.poll() is not None)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            os.close(master)
+            os.close(slave)
+
+    def test_limited_indicator_appears_in_footer_when_scan_is_capped(self):
+        items = [{"path": str(self.path), "title": "x.png", "caption": "", "updated": 0, "cached_path": None}]
+        with patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            gallery.draw(items, 0, "", False, False, {}, mode="grid", source="/some/big/dir",
+                         recursive=True, scanning=False, limited=True)
+            self.assertIn("limited", out.getvalue())
+            self.assertIn("recursive", out.getvalue())
+        with patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            gallery.draw(items, 0, "", False, False, {}, mode="grid", source="/some/big/dir",
+                         recursive=True, scanning=False, limited=False)
+            self.assertNotIn("limited", out.getvalue())
+        with patch.object(gallery, "terminal_size", return_value=(99, 28, 8, 16)), \
+             patch("sys.stdout", new=io.StringIO()) as out:
+            gallery.draw([], 0, "", False, False, {}, mode="preview", source="/some/big/dir",
+                         recursive=False, scanning=True, limited=False)
+            self.assertIn("scanning", out.getvalue())
+
+    def test_scan_directory_stops_within_time_and_entry_budget_and_reports_limited(self):
+        root = Path(self.temp.name) / "huge"
+        root.mkdir()
+        for i in range(50):
+            (root / ("%03d.png" % i)).write_bytes(b"x")
+        result = gallery.scan_directory(root, entry_budget=10, time_budget=5)
+        self.assertTrue(result.limited)
+        self.assertLessEqual(len(result), 10)
+
+        unlimited = gallery.scan_directory(root)
+        self.assertFalse(unlimited.limited)
+        self.assertEqual(len(unlimited), 50)
 
     def test_missing_image_does_not_replace_selection(self):
         token = gallery.publish(self.db, self.path)

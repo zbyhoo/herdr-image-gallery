@@ -89,12 +89,33 @@ def image_path(value):
     return p
 
 
-def scan_directory(directory, recursive=False, limit=2000):
+class ScanResult(list):
+    """A scan_directory() result: the capped item list plus whether traversal was cut short."""
+
+    def __new__(cls, items, limited=False):
+        result = super().__new__(cls)
+        result.limited = limited
+        return result
+
+    def __init__(self, items, limited=False):
+        super().__init__(items)
+        self.limited = limited
+
+
+# Keeps `r` on huge trees (~, /) from freezing the pane: traversal stops once either budget
+# is spent, even if far short of `limit` items.
+SCAN_TIME_BUDGET = 1.0
+SCAN_ENTRY_BUDGET = 100_000
+
+
+def scan_directory(directory, recursive=False, limit=2000,
+                    time_budget=SCAN_TIME_BUDGET, entry_budget=SCAN_ENTRY_BUDGET):
     root = Path(directory).expanduser().resolve(strict=True)
     if not root.is_dir():
         raise NotADirectoryError("Not a directory: " + str(root))
     found, stack, seen = [], [(root, True)], set()
-    while stack:
+    visited, deadline, limited = 0, time.monotonic() + time_budget, False
+    while stack and not limited:
         current, is_root = stack.pop()
         real = os.path.realpath(current)
         if real in seen:
@@ -112,6 +133,10 @@ def scan_directory(directory, recursive=False, limit=2000):
             continue
         with entries:
             for entry in entries:
+                visited += 1
+                if visited > entry_budget or time.monotonic() > deadline:
+                    limited = True
+                    break
                 if entry.name.startswith("."):
                     continue
                 try:
@@ -130,7 +155,8 @@ def scan_directory(directory, recursive=False, limit=2000):
                 found.append({"path": str(Path(entry.path)), "title": rel, "caption": "",
                               "updated": st.st_mtime, "cached_path": None})
     found.sort(key=lambda item: item["title"].casefold())
-    return found[:limit]
+    limited = limited or len(found) > limit
+    return ScanResult(found[:limit], limited)
 
 
 def archive(db, path):
@@ -508,7 +534,8 @@ def gallery_heading(label, paused):
     return "IMAGE GALLERY  |  " + label + "  |  " + ("HOLD" if paused else "LIVE")
 
 
-def draw(items, index, query, searching, paused, cache, mode="preview", source="", browsing=False, browse_input="", recursive=False):
+def draw(items, index, query, searching, paused, cache, mode="preview", source="", browsing=False,
+         browse_input="", recursive=False, scanning=False, limited=False):
     cols, rows, cw, ch = terminal_size()
     prepared = None
     if mode == "preview" and items:
@@ -540,7 +567,10 @@ def draw(items, index, query, searching, paused, cache, mode="preview", source="
         if searching:
             return "/ " + query
         if source:
-            return "DIR: %s (%d images%s)" % (source, len(items), ", recursive" if recursive else "")
+            if scanning and not items:
+                return "DIR: %s (scanning...)" % source
+            count = "%d+ images, limited" % len(items) if limited else "%d images" % len(items)
+            return "DIR: %s (%s%s)" % (source, count, ", recursive" if recursive else "")
         return default
 
     line(1, gallery_heading(cache.get("workspace_label", os.environ["HERDR_WORKSPACE_ID"]), paused), "1;36")
@@ -548,6 +578,8 @@ def draw(items, index, query, searching, paused, cache, mode="preview", source="
     if not items:
         if query:
             empty = "No matching images."
+        elif source and scanning:
+            empty = "Scanning..."
         elif source:
             empty = "No images in this directory."
         else:
@@ -742,6 +774,9 @@ def gallery(db):
     last_browse_request = resume.get("browse_request", "")
     browsing, browse_input = False, ""
     last_scan, last_scan_key, scanned_items, scan_error = 0, None, [], ""
+    scan_limited, scanning, scan_interval = False, False, 2
+    scan_future, scan_pending_key, scan_started = None, None, 0
+    scan_executor = ThreadPoolExecutor(max_workers=1)
     cache, previous, heartbeat = {}, None, 0
     setup = any(agent_skill_status(a) != "installed" for a in (detected_agents() or list(AGENTS))) and not get(db, "codex_setup_dismissed")
     setup_message = ""
@@ -786,23 +821,41 @@ def gallery(db):
                 searching, last_request, mode = False, request, "preview"
                 source, browsing = "", False
                 last_browse_request = get(db, "browse_request")
+                last_scan_key, scan_future = None, None
             browse_req = get(db, "browse_request")
             if not new_image and browse_req != last_browse_request and not paused:
                 last_browse_request = browse_req
                 source = get(db, "browse_dir")
                 recursive = get(db, "browse_recursive") == "1"
                 selected, query, searching, browsing, mode = "", "", False, False, "preview"
-                last_scan_key = None
+                last_scan_key, scan_future = None, None
             if source:
                 now = time.monotonic()
                 scan_key = (source, recursive)
-                if scan_key != last_scan_key or now - last_scan >= 2:
+                if scan_key != last_scan_key:
+                    # A new source/recursion setting discards any in-flight scan's result
+                    # (checked via scan_pending_key below) and shows "scanning..." until it lands.
+                    last_scan_key = scan_key
+                    scanned_items, scan_limited, scanning, scan_future = [], False, True, None
+                    last_scan, scan_interval = 0, 2
+                if scan_future is None and now - last_scan >= scan_interval:
+                    scan_pending_key, scan_started = scan_key, now
+                    scan_future = scan_executor.submit(scan_directory, source, recursive)
+                if scan_future is not None and scan_future.done():
+                    future, scan_future = scan_future, None
                     try:
-                        scanned_items = scan_directory(source, recursive)
-                        last_scan, last_scan_key, scan_error = now, scan_key, ""
+                        result = future.result()
+                        if scan_pending_key == scan_key:
+                            scanned_items, scan_limited, scan_error = result, result.limited, ""
+                            scanning = False
+                            scan_interval = min(30, max(2, (time.monotonic() - scan_started) * 4))
                     except (OSError, ValueError) as exc:
-                        scan_error = str(exc)
-                        source, scanned_items, last_scan_key = "", [], None
+                        if scan_pending_key == scan_key:
+                            scan_error = str(exc)
+                            source, scanned_items, last_scan_key, scanning = "", [], None, False
+                    last_scan = time.monotonic()
+            else:
+                scan_future = None
             history = source == ""
             raw_items = list(db.execute("SELECT * FROM images ORDER BY id")) if history else scanned_items
             items = [r for r in raw_items
@@ -811,14 +864,15 @@ def gallery(db):
             if items:
                 selected = items[index]["path"]
             state = ([(r["path"], r["updated"]) for r in items], index, query, searching, paused, terminal_size(),
-                     last_request, mode, setup, setup_message, source, recursive, browsing, browse_input, last_browse_request)
+                     last_request, mode, setup, setup_message, source, recursive, browsing, browse_input,
+                     last_browse_request, scanning, scan_limited)
             if resize_refresh.due(state[5]):
                 # Grid selection caching must not suppress host-surface restoration.
                 cache.pop("grid_signature", None)
                 previous = None
             if state != previous:
                 error = draw(items, index, query, searching, paused, cache, mode,
-                             source, browsing, browse_input, recursive)
+                             source, browsing, browse_input, recursive, scanning, scan_limited)
                 if scan_error:
                     error = "Cannot browse: " + scan_error
                     cols, rows = terminal_size()[:2]
@@ -829,7 +883,8 @@ def gallery(db):
                     preview_metrics=cache.get("metrics", ""),
                     view_state=json.dumps({"path": selected, "query": query, "request": last_request, "paused": paused,
                                            "mode": mode, "source": source, "recursive": recursive,
-                                           "browse_request": last_browse_request, "browsing": browsing}))
+                                           "browse_request": last_browse_request, "browsing": browsing,
+                                           "scanning": scanning, "limited": scan_limited}))
                 if native_graphics():
                     put(db, terminal_reply="OK" if not error else error, terminal_request=last_request,
                         acknowledgement="herdr-stream-submitted")
@@ -953,6 +1008,7 @@ def gallery(db):
                         step = page_size if key == "\x1b[6~" else -page_size
                 selected = items[(index + step) % len(items)]["path"]
     finally:
+        scan_executor.shutdown(wait=False, cancel_futures=True)
         signal.signal(signal.SIGWINCH, old_winch)
         put(db, heartbeat=0)
         delete_image()

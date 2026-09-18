@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Minimum supported Python (README requirement) on Linux.
+          - os: ubuntu-latest
+            python-version: "3.9"
+          # Current 3.x on Linux.
+          - os: ubuntu-latest
+            python-version: "3.14"
+          # macOS: sips and the pasteboard (osascript) are built in,
+          # so no system packages are needed.
+          - os: macos-latest
+            python-version: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Linux image dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - name: Run test suite
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v

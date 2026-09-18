@@ -221,3 +221,7 @@ Tests cover image history, decoding, preview replacement, loading indicators, ag
 To report a problem, [open an issue](https://github.com/zbyhoo/herdr-image-gallery/issues) with your OS, Herdr, and terminal versions, reproduction steps, and any error shown in the gallery. Review diagnostic output and screenshots for private paths or image content before sharing them.
 
 Agent integration follows the documented [Claude Code skill directories and invocation](https://code.claude.com/docs/en/skills). Normal agent permissions still apply; installing the gallery does not grant unrestricted shell access.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

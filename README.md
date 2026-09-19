@@ -1,5 +1,7 @@
 # Herdr Image Gallery
 
+[![Tests](https://github.com/zbyhoo/herdr-image-gallery/actions/workflows/tests.yml/badge.svg)](https://github.com/zbyhoo/herdr-image-gallery/actions/workflows/tests.yml)
+
 View AI-generated images, screenshots, and local artwork inside [Herdr](https://herdr.dev), without leaving your terminal. Browse a thumbnail grid, open a larger preview, or let Codex or Claude Code send images to the gallery as it creates them.
 
 The plugin includes a shared Codex / Claude Code skill and works independently through its CLI and local image links.

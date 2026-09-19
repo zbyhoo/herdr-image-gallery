@@ -85,7 +85,8 @@ class LinuxImageTests(unittest.TestCase):
 
 class GalleryTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        # Resolve the temp root (macOS: /var -> /private/var) so it matches the resolved paths gallery stores.
+        self.temp = tempfile.TemporaryDirectory(dir=os.path.realpath(tempfile.gettempdir()))
         self.env = patch.dict(os.environ, {"HERDR_GALLERY_STATE_DIR": self.temp.name,
                              "HERDR_GALLERY_AUTO_SETUP": "0", "CLAUDE_CONFIG_DIR": str(Path(self.temp.name) / "claude"),
                              "HERDR_PANE_ID": "", "CODEX_HOME": str(Path(self.temp.name) / "codex"), "HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w1",

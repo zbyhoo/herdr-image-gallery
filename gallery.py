@@ -374,8 +374,12 @@ def preview(path, modified, available_width, available_height):
     else:
         metadata = subprocess.run(["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
                                   capture_output=True, text=True, check=True, timeout=10).stdout
-        width = int(re.search(r"pixelWidth:\s*(\d+)", metadata).group(1))
-        height = int(re.search(r"pixelHeight:\s*(\d+)", metadata).group(1))
+        # sips exits 0 on files it cannot decode; it just omits the dimensions.
+        width_match = re.search(r"pixelWidth:\s*(\d+)", metadata)
+        height_match = re.search(r"pixelHeight:\s*(\d+)", metadata)
+        if not width_match or not height_match:
+            raise ValueError("Unsupported image: " + str(path))
+        width, height = int(width_match.group(1)), int(height_match.group(1))
     scale = min(available_width / width, available_height / height, 960 / max(width, height), 1)
     data, width, height = image_data(path, max(1, round(max(width, height) * scale)))
     # Keep compressed, display-sized frames for back/forward navigation.

@@ -7,7 +7,7 @@ description: Show generated images, imagegen results, screenshots and locally ac
 
 The user wants graphics displayed in a terminal gallery as soon as the agent (Codex or Claude Code) creates or receives them. Check `HERDR_ENV=1` and `HERDR_WORKSPACE_ID`; outside Herdr use the normal image presentation flow.
 
-After each final image is saved (including imagegen output), send its absolute local path immediately, before the final answer. Also send user-attached images when their local file paths are available. Do not claim an attachment is available when you only have its visual conversation representation; ask for a local path only if showing it in the gallery is necessary.
+After each final image is saved (including imagegen output), send its absolute local path immediately, before the final answer. When you hold image BYTES with no file the user's machine can read, for example base64 `image` content from an MCP tool result or the output of a remote renderer, send them straight to `show -` (see below) instead of asking anyone to save a file first. Also send user-attached images when their local file paths are available. Do not claim an attachment is available when you only have its visual conversation representation; ask for a local path only if showing it in the gallery is necessary.
 
 Use the bundled `scripts/gallery.py` helper, resolving this skill's directory from its actual installed location. It resolves symlinks and forwards to the plugin checkout. Resolve the helper relative to the directory containing this SKILL.md; never assume the caller uses Codex. In Claude Code use:
 
@@ -21,7 +21,26 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/gallery.py" show '/absolute/path/image.png'
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/herdr-image-gallery/scripts/gallery.py" show '/absolute/path/image.png' --title 'Short title' --caption 'Short description' --wait 10
 ```
 
-Use proper shell quoting for paths and text. Send each image separately in a batch so it has its own title and description. `show` opens the registered plugin pane to the RIGHT when needed and otherwise updates it without changing keyboard focus. Preserve the user's chosen layout; do not force the gallery below the conversation. It routes by the caller's Herdr socket and workspace, so never override those to target a different project.
+Use proper shell quoting for paths and text. Give every image its own title and description: repeat `--title` and `--caption` once per image (`show a.png b.png --title 'A' --title 'B' --caption 'ca' --caption 'cb'`), or use `--stdin-json` below; a single `--title`/`--caption` still applies to all of them. Publishing many images in ONE call is preferred over one process per image.
+
+**Images you have as bytes, with no file:** pipe them into `show -`. Always through stdin, never in an argument: one argument is capped at 128 KiB, far below a real image. Replace `SCRIPT` with the helper path resolved as above.
+
+```sh
+# base64 from an MCP tool result
+jq -r '.content[0].data' result.json | python3 SCRIPT show - --stdin-base64 --title 'Axe small' --caption 'Rotation, top view' --wait 10
+
+# raw bytes straight from a producer
+some-renderer --format png | python3 SCRIPT show - --title 'Contact sheet'
+
+# many images in ONE call, each with its own title and caption
+jq -c '[.content[] | select(.type == "image")]' result.json | python3 SCRIPT show - --stdin-json --wait 10
+```
+
+`--stdin-json` takes a JSON array (or JSON Lines) of entries `{"data": "<base64>", "mimeType": "image/png", "title": "...", "caption": "..."}`; an MCP `image` content block passes through unchanged, and an entry may use `"path"` instead of `"data"` to mix files into the same call. A bad entry is named by index and nothing is published.
+
+The bytes are copied into the gallery's own state directory under a sha256 name, so nothing is written into the user's project, republishing identical bytes updates one history entry instead of adding another, and `status`/`list` show such images exactly like published files. The format comes from the magic bytes; pass `--format` only to declare it (content wins, a mismatch is a warning). Supported: PNG, JPEG, WebP, GIF, TIFF, BMP, HEIC; anything else is refused. Limits: 64 MiB per image, 256 MiB per call, exceeded as a clear error and never a silent truncation. The gallery never fetches images from URLs: download the bytes with your own tools if the user asks for that, then pipe them in.
+
+`show` opens the registered plugin pane to the RIGHT when needed and otherwise updates it without changing keyboard focus. Preserve the user's chosen layout; do not force the gallery below the conversation. It routes by the caller's Herdr socket and workspace, so never override those to target a different project.
 
 The user owns the gallery's position and size after it opens. Never move, swap, resize, close/recreate or refocus an existing gallery as part of displaying images, debugging or updating the plugin. A right split is only the default for the FIRST opening or after the user has closed the gallery. Code updates reload in the same terminal process and pane; preserve any location the user chose, including placement above/below other right-column tools. Only an explicit user request to rearrange the gallery authorizes layout changes.
 

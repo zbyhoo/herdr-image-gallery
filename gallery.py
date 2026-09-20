@@ -31,6 +31,20 @@ PLUGIN = "local.image-gallery"
 IMAGE_ID = 71031
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff", ".bmp", ".heic"}
 
+# One limit for a single image whatever its source (file, stdin bytes, manifest entry), and a
+# separate cap for the whole stdin payload, which may carry many base64-inflated images.
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_STDIN_BYTES = 256 * 1024 * 1024
+# Canonical format -> the extension the archive copy gets; every value is in EXTENSIONS, so a
+# bytes publish lands on a path the viewer, `c`, `list` and the link handler already understand.
+FORMATS = {"png": ".png", "jpeg": ".jpg", "gif": ".gif", "webp": ".webp",
+           "tiff": ".tiff", "bmp": ".bmp", "heic": ".heic"}
+# Values accepted from --format and from a manifest `format`/`mimeType`, including MCP mime types.
+FORMAT_ALIASES = {"jpg": "jpeg", "tif": "tiff", "heif": "heic"}
+FORMAT_ALIASES.update({name: name for name in FORMATS})
+FORMAT_ALIASES.update({prefix + alias: name for alias, name in list(FORMAT_ALIASES.items())
+                       for prefix in ("image/", ".")})
+
 
 def herdr(*args):
     result = subprocess.run([os.environ.get("HERDR_BIN_PATH", "herdr"), *args],
@@ -84,9 +98,163 @@ def image_path(value):
     p = Path(value).expanduser().resolve(strict=True)
     if not p.is_file() or p.suffix.lower() not in EXTENSIONS:
         raise ValueError("Unsupported image: " + str(p))
-    if p.stat().st_size > 64 * 1024 * 1024:
-        raise ValueError("Image exceeds 64 MiB: " + str(p))
+    if p.stat().st_size > MAX_IMAGE_BYTES:
+        raise ValueError("Image exceeds %d MiB: %s" % (MAX_IMAGE_BYTES // (1024 * 1024), p))
     return p
+
+
+# BMP has no distinctive signature beyond "BM", so the DIB header size guards against
+# arbitrary text that happens to start with those two bytes.
+BMP_HEADER_SIZES = {12, 40, 52, 56, 64, 108, 124}
+# ISO-BMFF brands the viewer can decode as .heic. AVIF ("avif"/"avis") is deliberately absent:
+# it is a different codec in the same container and has no supported extension here.
+HEIC_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs"}
+
+
+def sniff_format(data):
+    """Return the canonical format of an image from its magic bytes, or None."""
+    data = bytes(data)
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "webp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return "tiff"
+    if data.startswith(b"BM") and len(data) >= 18 and struct.unpack("<I", data[14:18])[0] in BMP_HEADER_SIZES:
+        return "bmp"
+    if data[4:8] == b"ftyp":
+        if data[8:12] in HEIC_BRANDS:
+            return "heic"
+        if data[8:12] in (b"mif1", b"msf1"):
+            # A generic HEIF brand only counts when a HEIC brand follows among the compatible ones.
+            size = struct.unpack(">I", data[0:4])[0]
+            end = size if 16 < size <= len(data) else len(data)
+            for start in range(16, end - 3, 4):
+                if data[start:start + 4] in HEIC_BRANDS:
+                    return "heic"
+    return None
+
+
+def decode_base64(payload):
+    """Decode base64 bytes, tolerating whitespace, a data: URL prefix and missing padding."""
+    text = bytes(payload).translate(None, b" \t\r\n\x0b\x0c")
+    if text[:5].lower() == b"data:":
+        marker = text.find(b"base64,")
+        if marker < 0:
+            raise ValueError("data: URL is not base64-encoded")
+        text = text[marker + len(b"base64,"):]
+    return base64.b64decode(text + b"=" * (-len(text) % 4), validate=True)
+
+
+def decode_image_bytes(payload, base64_mode=False, declared="", label="stdin"):
+    """Turn a raw or base64 payload into (image bytes, canonical format).
+
+    Without base64_mode the payload is used as-is when it already sniffs as an image and is
+    tried as base64 otherwise, so a forgotten --stdin-base64 does not cost the caller a retry:
+    real image bytes are never valid base64 of a different image.
+    """
+    if base64_mode:
+        try:
+            data = decode_base64(payload)
+        except ValueError as exc:
+            raise ValueError("%s is not valid base64: %s" % (label, exc))
+    else:
+        data = bytes(payload)
+        if sniff_format(data) is None:
+            try:
+                decoded = decode_base64(data)
+            except ValueError:
+                decoded = b""
+            if sniff_format(decoded) is not None:
+                data = decoded
+    detected = sniff_format(data)
+    if detected is None:
+        raise ValueError("%s is not a supported image (PNG, JPEG, WebP, GIF, TIFF, BMP, HEIC)." % label)
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("%s exceeds %d MiB (got %.1f MiB)."
+                         % (label, MAX_IMAGE_BYTES // (1024 * 1024), len(data) / (1024 * 1024)))
+    if declared and FORMAT_ALIASES.get(str(declared).strip().lower()) != detected:
+        # Upstream mime types are often wrong (and sometimes unknown here); the content decides,
+        # and refusing a valid image over its label helps nobody.
+        print("Image Gallery: %s declares %s but the bytes are %s; using %s."
+              % (label, declared, detected, detected), file=sys.stderr)
+    return data, detected
+
+
+def read_stdin():
+    """Read the whole stdin payload, refusing a terminal, emptiness and anything over the cap."""
+    empty = ValueError("No image data on stdin: pipe image bytes or base64 into `show -`.")
+    # sys.stdin is None when fd 0 is closed, and isatty() raises on a detached stream.
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    if stream is None or not hasattr(stream, "read"):
+        raise empty
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    if interactive:
+        raise empty
+    # One byte over the cap is enough to tell "at the limit" from "too big"; nothing is truncated.
+    data = stream.read(MAX_STDIN_BYTES + 1)
+    if not data:
+        raise empty
+    if len(data) > MAX_STDIN_BYTES:
+        raise ValueError("stdin payload exceeds %d MiB; publish fewer or smaller images per call."
+                         % (MAX_STDIN_BYTES // (1024 * 1024)))
+    return data
+
+
+def parse_manifest(payload):
+    """Parse --stdin-json: a JSON array, a single JSON object, or JSON Lines (what `jq -c` emits)."""
+    try:
+        text = bytes(payload).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("--stdin-json expects UTF-8 JSON on stdin, not raw image bytes.")
+    if not text.strip():
+        raise ValueError("--stdin-json expects a JSON array or JSON Lines on stdin, got nothing.")
+    try:
+        document = json.loads(text)
+    except ValueError:
+        document = []
+        for number, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                document.append(json.loads(line))
+            except ValueError as exc:
+                raise ValueError("--stdin-json is neither a JSON document nor JSON Lines "
+                                 "(line %d: %s)." % (number, exc))
+    if isinstance(document, dict):
+        document = [document]
+    if not isinstance(document, list) or not document:
+        raise ValueError("--stdin-json expects a non-empty JSON array of image entries.")
+    entries = []
+    for index, raw in enumerate(document):
+        label = "--stdin-json[%d]" % index
+        if not isinstance(raw, dict):
+            raise ValueError("%s: expected an object with `data` (base64) or `path`." % label)
+        data, path = raw.get("data", raw.get("base64")), raw.get("path")
+        if (data is None) == (path is None):
+            raise ValueError("%s: give either `data` (base64) or `path`, not both or neither." % label)
+        for key in ("title", "caption"):
+            if raw.get(key) is not None and not isinstance(raw[key], str):
+                raise ValueError("%s: `%s` must be a string." % (label, key))
+        entry = {"title": raw.get("title") or "", "caption": raw.get("caption") or "",
+                 "format": raw.get("format") or raw.get("mimeType") or "", "label": label}
+        if path is not None:
+            if not isinstance(path, str):
+                raise ValueError("%s: `path` must be a string." % label)
+            entry["path"] = path
+        else:
+            if not isinstance(data, str):
+                raise ValueError("%s: `data` must be a base64 string." % label)
+            entry["payload"] = data.encode("ascii", errors="replace")
+        entries.append(entry)
+    return entries
 
 
 class ScanResult(list):
@@ -149,7 +317,7 @@ def scan_directory(directory, recursive=False, limit=2000, sort="name",
                     st = entry.stat(follow_symlinks=True)
                 except OSError:
                     continue
-                if Path(entry.name).suffix.lower() not in EXTENSIONS or st.st_size > 64 * 1024 * 1024:
+                if Path(entry.name).suffix.lower() not in EXTENSIONS or st.st_size > MAX_IMAGE_BYTES:
                     continue
                 rel = Path(entry.path).relative_to(root).as_posix()
                 found.append({"path": str(Path(entry.path)), "title": rel, "caption": "",
@@ -162,11 +330,11 @@ def scan_directory(directory, recursive=False, limit=2000, sort="name",
     return ScanResult(found[:limit], limited)
 
 
-def archive(db, path):
+def archive_bytes(db, data, suffix):
+    """Store bytes under <state>/images/<sha256><suffix>; the same content never lands twice."""
     directory = Path(db.execute("PRAGMA database_list").fetchone()[2]).parent / "images"
     directory.mkdir(exist_ok=True, mode=0o700)
-    data = path.read_bytes()
-    destination = directory / (hashlib.sha256(data).hexdigest() + path.suffix.lower())
+    destination = directory / (hashlib.sha256(data).hexdigest() + suffix.lower())
     if not destination.exists():
         with tempfile.NamedTemporaryFile(dir=directory, delete=False) as out:
             temporary = Path(out.name)
@@ -176,6 +344,10 @@ def archive(db, path):
         finally:
             temporary.unlink(missing_ok=True)
     return destination
+
+
+def archive(db, path):
+    return archive_bytes(db, path.read_bytes(), path.suffix)
 
 
 def display_path(item):
@@ -270,20 +442,54 @@ def copy_selection(items, index):
     sys.stdout.flush()
 
 
-def publish(db, path, title="", caption=""):
-    path = image_path(path)
-    cached = archive(db, path)
-    prior = db.execute("SELECT title,caption FROM images WHERE path=?", (str(path),)).fetchone()
-    title = title or (prior["title"] if prior else path.stem)
-    caption = caption or (prior["caption"] if prior else "")
+def publish_many(db, entries):
+    """Publish images from files and/or bytes in one go; returns (request token, published rows).
+
+    Every entry is validated before anything is archived and all rows share one transaction, so a
+    single bad entry publishes nothing. An entry is a dict with `path` OR `data` (already decoded
+    image bytes) plus `format`, and optional `title`/`caption`.
+    """
+    if not entries:
+        raise ValueError("Nothing to publish.")
+    checked = []
+    for entry in entries:
+        entry = dict(entry)
+        if entry.get("data") is None:
+            entry["path"] = image_path(entry["path"])
+        checked.append(entry)
+    published, now = [], time.time()
+    for entry in checked:
+        if entry.get("data") is None:
+            path = entry["path"]
+            cached = archive(db, path)
+            suffix = path.suffix.lower().lstrip(".")
+            fmt = FORMAT_ALIASES.get(suffix, suffix)
+            default_title = path.stem
+        else:
+            fmt = entry["format"]
+            # path == cached_path: the archive copy IS the image, so history, the viewer, `c`,
+            # `list`, `status` and the link handler need no special case, and `path UNIQUE`
+            # makes republishing identical bytes update one row instead of adding another.
+            cached = path = archive_bytes(db, entry["data"], FORMATS[fmt])
+            default_title = "image-" + cached.stem[:12]
+        prior = db.execute("SELECT title,caption FROM images WHERE path=?", (str(path),)).fetchone()
+        published.append({"path": str(path), "cached_path": str(cached), "sha256": cached.stem,
+                          "format": fmt, "source": "path" if entry.get("data") is None else "stdin",
+                          "title": entry.get("title") or (prior["title"] if prior else default_title),
+                          "caption": entry.get("caption") or (prior["caption"] if prior else "")})
     token = str(time.time_ns())
     with db:
-        db.execute("INSERT INTO images(path,title,caption,updated,cached_path) VALUES (?,?,?,?,?) "
-                   "ON CONFLICT(path) DO UPDATE SET title=excluded.title,caption=excluded.caption,updated=excluded.updated,cached_path=excluded.cached_path",
-                   (str(path), title, caption, time.time(), str(cached)))
+        db.executemany("INSERT INTO images(path,title,caption,updated,cached_path) VALUES (?,?,?,?,?) "
+                       "ON CONFLICT(path) DO UPDATE SET title=excluded.title,caption=excluded.caption,updated=excluded.updated,cached_path=excluded.cached_path",
+                       [(item["path"], item["title"], item["caption"], now, item["cached_path"])
+                        for item in published])
         db.executemany("INSERT OR REPLACE INTO state VALUES (?,?)",
-                       [("requested_path", str(path)), ("request", token)])
-    return token
+                       [("requested_path", published[-1]["path"]), ("request", token)])
+    return token, published
+
+
+def publish(db, path, title="", caption=""):
+    return publish_many(db, [{"path": path, "title": title, "caption": caption}])[0]
 
 
 def link_path(url):
@@ -1033,12 +1239,82 @@ def gallery(db):
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
 
 
+def pair_values(values, count, flag, parser):
+    """0 values = defaults, 1 = the same for every image, N = paired with the N images."""
+    if not values:
+        return [""] * count
+    if len(values) == 1:
+        return [values[0]] * count
+    if len(values) != count:
+        parser.error("%s given %d times for %d image(s): pass it once for all, once per image, or not at all"
+                     % (flag, len(values), count))
+    return list(values)
+
+
+def show_entries(args, parser):
+    """Build publish_many() entries from the command line, reading stdin when `-` is given."""
+    paths = list(args.paths)
+    if "-" in paths and len(paths) > 1:
+        parser.error("`-` reads image bytes from stdin and cannot be mixed with file paths; "
+                     "use --stdin-json to publish several images from stdin in one call")
+    from_stdin = paths == ["-"] or (not paths and (args.stdin_base64 or args.stdin_json))
+    if paths and paths != ["-"] and (args.stdin_base64 or args.stdin_json):
+        parser.error("--stdin-base64 and --stdin-json read the image bytes from stdin; pass `-` instead of a path")
+    if not from_stdin:
+        if not paths:
+            parser.error("show requires at least one image path, or `-` to read image bytes from stdin")
+        titles = pair_values(args.title, len(paths), "--title", parser)
+        captions = pair_values(args.caption, len(paths), "--caption", parser)
+        return [{"path": path, "title": title, "caption": caption}
+                for path, title, caption in zip(paths, titles, captions)]
+    declared = args.format or ""
+    payload = read_stdin()
+    if not args.stdin_json:
+        titles = pair_values(args.title, 1, "--title", parser)
+        captions = pair_values(args.caption, 1, "--caption", parser)
+        data, detected = decode_image_bytes(payload, args.stdin_base64, declared)
+        return [{"data": data, "format": detected, "title": titles[0], "caption": captions[0]}]
+    for flag, values in (("--title", args.title), ("--caption", args.caption)):
+        if len(values) > 1:
+            parser.error("%s can be given at most once with --stdin-json; give each entry its own %s"
+                         % (flag, flag.lstrip("-")))
+    entries = []
+    for entry in parse_manifest(payload):
+        label = entry["label"]
+        title = entry["title"] or (args.title[0] if args.title else "")
+        caption = entry["caption"] or (args.caption[0] if args.caption else "")
+        if "path" in entry:
+            try:
+                image_path(entry["path"])
+            except (OSError, ValueError) as exc:
+                raise ValueError("%s: %s" % (label, exc))
+            entries.append({"path": entry["path"], "title": title, "caption": caption})
+            continue
+        try:
+            data, detected = decode_image_bytes(entry["payload"], True, entry["format"] or declared, label)
+        except ValueError as exc:
+            raise ValueError(str(exc) if str(exc).startswith(label) else "%s: %s" % (label, exc))
+        entries.append({"data": data, "format": detected, "title": title, "caption": caption})
+    return entries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", nargs="?", default="view", choices=["view", "show", "open", "list", "status", "link", "browse", "setup-codex", "setup-claude", "setup-agents", "agent-status", "auto-setup"])
     parser.add_argument("paths", nargs="*")
-    parser.add_argument("--title", default="")
-    parser.add_argument("--caption", default="")
+    parser.add_argument("--title", action="append", default=[], metavar="TEXT",
+                        help="Image title; repeat once per image to pair titles by position")
+    parser.add_argument("--caption", action="append", default=[], metavar="TEXT",
+                        help="Image caption; repeat once per image to pair captions by position")
+    parser.add_argument("--format", choices=sorted(FORMAT_ALIASES), default=None, metavar="FORMAT",
+                        help="Format of the bytes on stdin (%s); detected from the content when omitted"
+                             % ", ".join(sorted(FORMATS)))
+    stdin_source = parser.add_mutually_exclusive_group()
+    stdin_source.add_argument("--stdin-base64", action="store_true",
+                              help="stdin carries base64-encoded image data")
+    stdin_source.add_argument("--stdin-json", action="store_true",
+                              help="stdin carries a JSON array or JSON Lines of image entries "
+                                   "({data|path, title, caption, format})")
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--open", action="store_true", dest="open_action")
@@ -1082,11 +1358,7 @@ def main():
         if args.open_action or args.command == "open":
             print(json.dumps(open_pane(db)))
         elif args.command == "show":
-            if not args.paths:
-                parser.error("show requires at least one image path")
-            paths = [image_path(p) for p in args.paths]
-            for p in paths:
-                token = publish(db, p, args.title, args.caption)
+            token, published = publish_many(db, show_entries(args, parser))
             if not args.no_open:
                 open_pane(db)
             end = time.monotonic() + args.wait
@@ -1096,7 +1368,9 @@ def main():
                 time.sleep(0.1)
             rendered = get(db, "terminal_request") == token and get(db, "terminal_reply") == "OK"
             error = get(db, "error") if get(db, "rendered_request") == token else ""
-            print(json.dumps({"request": token, "path": str(paths[-1]), "rendered": None if get(db, "acknowledgement") == "herdr-stream-submitted" else rendered and not error,
+            print(json.dumps({"request": token, "path": published[-1]["path"],
+                              "images": [{key: item[key] for key in ("path", "title", "sha256", "format", "source")}
+                                         for item in published], "rendered": None if get(db, "acknowledgement") == "herdr-stream-submitted" else rendered and not error,
                               "delivered": rendered and not error, "acknowledgement": get(db, "acknowledgement", "kitty-terminal"),
                               "error": error, "workspace": os.environ["HERDR_WORKSPACE_ID"]}))
             if args.wait and (not rendered or get(db, "error")):

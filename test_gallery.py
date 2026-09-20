@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 import tempfile
@@ -18,6 +19,15 @@ import unittest
 from unittest.mock import patch
 
 import gallery
+
+
+def make_png(width=2, height=2, color=b"\xff\x00\x00"):
+    """A minimal valid truecolor PNG; a different width gives different bytes and a different sha."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    raw = (b"\0" + color * width) * height
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux image integration")
@@ -69,6 +79,24 @@ class LinuxImageTests(unittest.TestCase):
             metadata = real_run([gallery.imagemagick(), str(output), "-format", "%w %h %[pixel:p{0,0}]", "info:"],
                                 check=True, capture_output=True, text=True).stdout
             self.assertTrue(metadata.startswith("1100 2 srgba(255,0,0,0.50196"), metadata)
+
+    def test_stdin_published_bytes_decode_through_preview(self):
+        original = self.path.read_bytes()
+        with tempfile.TemporaryDirectory(dir=os.path.realpath(tempfile.gettempdir())) as state:
+            with patch.dict(os.environ, {"HERDR_GALLERY_STATE_DIR": state, "HERDR_ENV": "1",
+                                         "HERDR_GALLERY_AUTO_SETUP": "0", "HERDR_WORKSPACE_ID": "w1",
+                                         "HERDR_SOCKET_PATH": "/tmp/test-herdr.sock"}):
+                db = gallery.connect()
+                try:
+                    data, fmt = gallery.decode_image_bytes(base64.b64encode(original), True)
+                    published = gallery.publish_many(db, [{"data": data, "format": fmt, "title": "Stdin"}])[1]
+                finally:
+                    db.close()
+            archived = Path(published[0]["path"])
+            self.assertEqual(archived.read_bytes(), original)
+            pixels, width, height = gallery.preview(str(archived), archived.stat().st_mtime_ns, 550, 100)
+            self.assertEqual((width, height), (550, 1))
+            self.assertEqual(len(zlib.decompress(base64.b64decode(pixels))), width * height * 3)
 
     def test_missing_decoder_reports_dependency(self):
         with patch.object(gallery.shutil, "which", return_value=None):
@@ -941,6 +969,282 @@ gallery.gallery(gallery.connect())
 
     def test_terminal_text_cannot_inject_escape_sequences(self):
         self.assertNotIn("\x1b", gallery.clean("title\x1b[2J\nnew"))
+
+
+class StdinPublishTests(unittest.TestCase):
+    """Publishing image BYTES: `show -`, --stdin-base64, --stdin-json, dedup, limits, sniffing."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.path.realpath(tempfile.gettempdir()))
+        self.addCleanup(self.temp.cleanup)
+        self.env = patch.dict(os.environ, {"HERDR_GALLERY_STATE_DIR": self.temp.name,
+                              "HERDR_GALLERY_AUTO_SETUP": "0", "CLAUDE_CONFIG_DIR": str(Path(self.temp.name) / "claude"),
+                              "HERDR_PANE_ID": "", "CODEX_HOME": str(Path(self.temp.name) / "codex"), "HERDR_ENV": "1",
+                              "HERDR_WORKSPACE_ID": "w1", "HERDR_SOCKET_PATH": "/tmp/test-herdr.sock"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.db = gallery.connect()
+        self.addCleanup(self.db.close)
+        self.png = make_png()
+        self.archive = Path(self.temp.name) / "images"
+
+    def cli(self, argv, stdin=b"", tty=False):
+        """Run main() in-process with bytes on stdin; returns (exit code, stdout JSON or raw, stderr)."""
+        class FakeStdin(io.TextIOWrapper):
+            def isatty(self):
+                return tty
+        source = FakeStdin(io.BytesIO(stdin))
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", [gallery.__file__] + argv), patch.object(sys, "stdin", source), \
+             patch("sys.stdout", new=out), patch("sys.stderr", new=err), patch.object(gallery, "open_pane"):
+            try:
+                code = gallery.main()
+            except SystemExit as exc:
+                code = exc.code
+        text = out.getvalue()
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = text
+        return code, payload, err.getvalue()
+
+    def rows(self):
+        return [dict(row) for row in self.db.execute("SELECT * FROM images ORDER BY id")]
+
+    def archived(self):
+        return sorted(path.name for path in self.archive.iterdir()) if self.archive.is_dir() else []
+
+    def test_base64_stdin_publishes_without_touching_the_caller_directory(self):
+        # The acceptance criterion, through the helper an agent actually runs, in a real process.
+        helper = Path(gallery.__file__).resolve().parent / "skills" / "herdr-image-gallery" / "scripts" / "gallery.py"
+        workdir = Path(self.temp.name) / "agent-cwd"
+        workdir.mkdir()
+        for label, payload in (("plain", base64.b64encode(self.png)),
+                               ("wrapped", base64.encodebytes(self.png)),
+                               ("data-url", b"data:image/png;base64," + base64.b64encode(self.png))):
+            with self.subTest(payload=label):
+                result = subprocess.run([sys.executable, str(helper), "show", "-", "--stdin-base64",
+                                         "--title", "Axe small", "--caption", "Rotation, top view", "--no-open"],
+                                        input=payload, capture_output=True, cwd=str(workdir),
+                                        env=dict(os.environ), timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                published = json.loads(result.stdout)["images"][0]
+                self.assertEqual(published["sha256"], hashlib.sha256(self.png).hexdigest())
+                self.assertEqual(published["title"], "Axe small")
+                self.assertEqual(published["format"], "png")
+                self.assertEqual(published["source"], "stdin")
+                self.assertEqual(Path(published["path"]).read_bytes(), self.png)
+        self.assertEqual(self.archived(), [hashlib.sha256(self.png).hexdigest() + ".png"])
+        self.assertEqual(sorted(p.name for p in workdir.iterdir()), [])
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["title"], rows[0]["caption"]), ("Axe small", "Rotation, top view"))
+        self.assertEqual(rows[0]["path"], rows[0]["cached_path"])
+
+    def test_raw_and_base64_stdin_are_detected_without_the_flag(self):
+        code, payload, _ = self.cli(["show", "-", "--no-open"], self.png)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["images"][0]["format"], "png")
+        # A forgotten --stdin-base64 still works: real image bytes are never base64 of an image.
+        code, wrapped, _ = self.cli(["show", "-", "--no-open"], base64.b64encode(make_png(3)))
+        self.assertEqual(code, 0)
+        self.assertEqual(wrapped["images"][0]["sha256"], hashlib.sha256(make_png(3)).hexdigest())
+        with self.assertRaisesRegex(ValueError, "not valid base64"):
+            self.cli(["show", "-", "--stdin-base64", "--no-open"], b"not!base64!!")
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_default_title_names_the_digest_and_format_mismatch_only_warns(self):
+        code, payload, err = self.cli(["show", "-", "--format", "image/jpeg", "--no-open"], self.png)
+        self.assertEqual(code, 0)
+        digest = hashlib.sha256(self.png).hexdigest()
+        self.assertEqual(payload["images"][0]["title"], "image-" + digest[:12])
+        self.assertIn("declares image/jpeg but the bytes are png", err)
+        # An unrecognised manifest mimeType is just another wrong label: warn, do not refuse.
+        code, manifest, err = self.cli(["show", "-", "--stdin-json", "--no-open"],
+                                       json.dumps([{"data": base64.b64encode(make_png(3)).decode(),
+                                                    "mimeType": "image/svg+xml"}]).encode())
+        self.assertEqual(code, 0)
+        self.assertEqual(manifest["images"][0]["format"], "png")
+        self.assertIn("--stdin-json[0] declares image/svg+xml but the bytes are png", err)
+        self.assertTrue(payload["path"].endswith(digest + ".png"), payload["path"])
+
+    def test_json_manifest_publishes_many_images_in_one_call(self):
+        first, second = make_png(2), make_png(3)
+        entries = [{"type": "image", "data": base64.b64encode(first).decode(), "mimeType": "image/png",
+                    "title": "Front", "caption": "front view"},
+                   {"data": base64.b64encode(second).decode(), "title": "Side", "caption": "side view"}]
+        path_entry = Path(self.temp.name) / "on-disk.png"
+        path_entry.write_bytes(make_png(4))
+        entries.append({"path": str(path_entry), "title": "From file"})
+        for label, payload in (("array", json.dumps(entries).encode()),
+                               ("json-lines", b"\n".join(json.dumps(e).encode() for e in entries))):
+            with self.subTest(form=label):
+                self.db.execute("DELETE FROM images")
+                self.db.commit()
+                code, result, _ = self.cli(["show", "-", "--stdin-json", "--no-open"], payload)
+                self.assertEqual(code, 0)
+                self.assertEqual([image["title"] for image in result["images"]], ["Front", "Side", "From file"])
+                self.assertEqual([image["source"] for image in result["images"]], ["stdin", "stdin", "path"])
+                self.assertEqual([row["caption"] for row in self.rows()], ["front view", "side view", ""])
+                self.assertEqual(result["path"], result["images"][-1]["path"])
+                self.assertEqual(gallery.get(self.db, "requested_path"), result["path"])
+        # A single CLI --title is the default only for entries that bring none of their own.
+        code, result, _ = self.cli(["show", "-", "--stdin-json", "--title", "Batch", "--no-open"],
+                                   json.dumps([{"data": base64.b64encode(make_png(5)).decode()},
+                                               {"data": base64.b64encode(make_png(6)).decode(), "title": "Own"}]).encode())
+        self.assertEqual([image["title"] for image in result["images"]], ["Batch", "Own"])
+
+    def test_one_bad_manifest_entry_names_its_index_and_publishes_nothing(self):
+        good = {"data": base64.b64encode(self.png).decode(), "title": "Good"}
+        for label, entry in (("not an image", {"data": base64.b64encode(b"plain text").decode()}),
+                             ("both keys", {"data": "x", "path": "/tmp/x.png"}),
+                             ("neither key", {"title": "empty"}),
+                             ("missing file", {"path": str(Path(self.temp.name) / "absent.png")}),
+                             ("not an object", "just a string")):
+            with self.subTest(entry=label):
+                result = subprocess.run([sys.executable, gallery.__file__, "show", "-", "--stdin-json", "--no-open"],
+                                        input=json.dumps([good, entry]).encode(), capture_output=True,
+                                        env=dict(os.environ), timeout=60)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(b"--stdin-json[1]", result.stderr)
+                self.assertEqual(self.rows(), [])
+                self.assertEqual(self.archived(), [])
+        broken = subprocess.run([sys.executable, gallery.__file__, "show", "-", "--stdin-json", "--no-open"],
+                                input=b'{"data": "', capture_output=True, env=dict(os.environ), timeout=60)
+        self.assertEqual(broken.returncode, 1)
+        self.assertIn(b"neither a JSON document nor JSON Lines", broken.stderr)
+
+    def test_identical_bytes_publish_once_and_keep_earlier_text(self):
+        self.cli(["show", "-", "--title", "First", "--caption", "Only caption", "--no-open"], self.png)
+        self.cli(["show", "-", "--title", "Second", "--no-open"], self.png)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["title"], rows[0]["caption"]), ("Second", "Only caption"))
+        self.assertEqual(self.archived(), [hashlib.sha256(self.png).hexdigest() + ".png"])
+        self.cli(["show", "-", "--no-open"], self.png)
+        self.assertEqual([row["title"] for row in self.rows()], ["Second"])
+
+    def test_oversized_payloads_are_refused_without_writing_anything(self):
+        # Limits are module constants so the real message formatting is exercised at MiB scale
+        # without allocating the production 64/256 MiB. Trailing bytes after IEND still sniff as PNG.
+        oversized = self.png + b"\0" * (2 * 1024 * 1024)
+        with patch.object(gallery, "MAX_IMAGE_BYTES", 1024 * 1024):
+            with self.assertRaisesRegex(ValueError, r"stdin exceeds 1 MiB \(got 2\.0 MiB\)"):
+                self.cli(["show", "-", "--no-open"], oversized)
+        with patch.object(gallery, "MAX_STDIN_BYTES", 1024 * 1024):
+            with self.assertRaisesRegex(ValueError, "stdin payload exceeds 1 MiB"):
+                self.cli(["show", "-", "--no-open"], oversized)
+        # Refused, not truncated: no row, no archive file, not even a partial one.
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.archived(), [])
+        with patch.object(gallery, "MAX_IMAGE_BYTES", 1024 * 1024):
+            with self.assertRaisesRegex(ValueError, r"--stdin-json\[0\] exceeds 1 MiB"):
+                self.cli(["show", "-", "--stdin-json", "--no-open"],
+                         json.dumps([{"data": base64.b64encode(oversized).decode()}]).encode())
+        self.assertEqual(self.archived(), [])
+
+    def test_magic_bytes_decide_the_format(self):
+        ftyp = lambda major, *compatible: (struct.pack(">I", 16 + 4 * len(compatible)) + b"ftyp" + major +
+                                           b"\x00\x00\x00\x00" + b"".join(compatible))
+        supported = {
+            "png": self.png,
+            "jpeg": b"\xff\xd8\xff\xe0\x00\x10JFIF\x00",
+            "gif": b"GIF89a\x02\x00\x02\x00",
+            "webp": b"RIFF" + struct.pack("<I", 100) + b"WEBPVP8 ",
+            "tiff": b"II*\x00\x08\x00\x00\x00",
+            "bmp": b"BM" + struct.pack("<IHHI", 122, 0, 0, 54) + struct.pack("<I", 40),
+            "heic": ftyp(b"heic"),
+        }
+        for name, data in supported.items():
+            with self.subTest(format=name):
+                self.assertEqual(gallery.sniff_format(data), name)
+        self.assertEqual(gallery.sniff_format(b"GIF87a\x02\x00"), "gif")
+        self.assertEqual(gallery.sniff_format(b"MM\x00*\x00\x00\x00\x08"), "tiff")
+        self.assertEqual(gallery.sniff_format(ftyp(b"mif1", b"mif1", b"heic")), "heic")
+        for name, data in (("avif", ftyp(b"avif", b"avif", b"mif1")),
+                           ("heif without a heic brand", ftyp(b"mif1", b"mif1", b"miaf")),
+                           ("text", b"hello world, not an image"),
+                           ("pdf", b"%PDF-1.7\n1 0 obj"),
+                           ("svg", b'<svg xmlns="http://www.w3.org/2000/svg"/>'),
+                           ("bmp-like text", b"BM this is just prose about bitmaps"),
+                           ("riff but not webp", b"RIFF" + struct.pack("<I", 100) + b"AVI LIST"),
+                           ("empty", b"")):
+            with self.subTest(rejected=name):
+                self.assertIsNone(gallery.sniff_format(data))
+        for rejected in (b"hello world, not an image", b"%PDF-1.7\n1 0 obj",
+                         b'<svg xmlns="http://www.w3.org/2000/svg"/>'):
+            with self.assertRaisesRegex(ValueError, "not a supported image"):
+                self.cli(["show", "-", "--no-open"], rejected)
+        self.assertEqual(self.rows(), [])
+
+    def test_stdin_argument_errors_are_explicit(self):
+        sample = Path(self.temp.name) / "file.png"
+        sample.write_bytes(self.png)
+        code, _, err = self.cli(["show", "-", str(sample), "--no-open"], self.png)
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be mixed with file paths", err)
+        code, _, err = self.cli(["show", str(sample), "--stdin-base64", "--no-open"], self.png)
+        self.assertEqual(code, 2)
+        self.assertIn("pass `-` instead of a path", err)
+        code, _, err = self.cli(["show", "-", "--stdin-json", "--title", "a", "--title", "b", "--no-open"], b"[]")
+        self.assertEqual(code, 2)
+        self.assertIn("at most once with --stdin-json", err)
+        code, _, err = self.cli(["show", "--no-open"], b"")
+        self.assertEqual(code, 2)
+        self.assertIn("`-` to read image bytes from stdin", err)
+        with self.assertRaisesRegex(ValueError, "No image data on stdin"):
+            self.cli(["show", "-", "--no-open"], b"", tty=True)
+        with self.assertRaisesRegex(ValueError, "No image data on stdin"):
+            self.cli(["show", "-", "--no-open"], b"")
+        # fd 0 closed: sys.stdin is None, and that must still be the clean message.
+        with patch.object(sys, "stdin", None), patch.object(sys, "argv", [gallery.__file__, "show", "-", "--no-open"]):
+            with self.assertRaisesRegex(ValueError, "No image data on stdin"):
+                gallery.main()
+        result = subprocess.run([sys.executable, gallery.__file__, "show", "-", "--format", "tga", "--no-open"],
+                                input=self.png, capture_output=True, env=dict(os.environ), timeout=60)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"invalid choice: 'tga'", result.stderr)
+        self.assertEqual(self.rows(), [])
+
+    def test_repeated_title_and_caption_pair_with_paths(self):
+        first, second = Path(self.temp.name) / "a.png", Path(self.temp.name) / "b.png"
+        first.write_bytes(make_png(2))
+        second.write_bytes(make_png(3))
+        code, payload, _ = self.cli(["show", str(first), str(second), "--title", "A", "--title", "B",
+                                     "--caption", "ca", "--caption", "cb", "--no-open"])
+        self.assertEqual(code, 0)
+        self.assertEqual([(row["title"], row["caption"]) for row in self.rows()], [("A", "ca"), ("B", "cb")])
+        # Legacy shape: one --title/--caption still applies to every path, and no key was dropped.
+        self.assertEqual(set(payload) - {"images"},
+                         {"request", "path", "rendered", "delivered", "acknowledgement", "error", "workspace"})
+        self.db.execute("DELETE FROM images")
+        self.db.commit()
+        self.cli(["show", str(first), str(second), "--title", "Both", "--no-open"])
+        self.assertEqual([row["title"] for row in self.rows()], ["Both", "Both"])
+        code, _, err = self.cli(["show", str(first), str(second), "--caption", "x", "--caption", "y",
+                                 "--caption", "z", "--no-open"])
+        self.assertEqual(code, 2)
+        self.assertIn("--caption given 3 times for 2 image(s)", err)
+
+    def test_status_and_list_report_bytes_and_files_alike(self):
+        sample = Path(self.temp.name) / "on-disk.png"
+        sample.write_bytes(make_png(4))
+        _, from_file, _ = self.cli(["show", str(sample), "--no-open"])
+        file_state = dict(self.db.execute("SELECT key,value FROM state"))
+        file_row = self.rows()[-1]
+        _, from_bytes, _ = self.cli(["show", "-", "--no-open"], self.png)
+        bytes_state = dict(self.db.execute("SELECT key,value FROM state"))
+        bytes_row = self.rows()[-1]
+        self.assertEqual(set(file_state), set(bytes_state))
+        self.assertEqual(set(file_row), set(bytes_row))
+        self.assertEqual(set(from_file), set(from_bytes))
+        self.assertEqual(bytes_state["requested_path"], from_bytes["path"])
+        self.assertTrue(all(bytes_row[column] for column in ("path", "title", "updated", "cached_path")))
+        code, listed, _ = self.cli(["list"])
+        self.assertEqual(code, 0)
+        self.assertEqual([item["path"] for item in listed], [file_row["path"], bytes_row["path"]])
+        code, reported, _ = self.cli(["status"])
+        self.assertEqual((code, reported["requested_path"]), (0, bytes_row["path"]))
 
 
 if __name__ == "__main__":

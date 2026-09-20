@@ -161,6 +161,10 @@ Without the skill, run `gallery.py` directly from the plugin directory. Locate t
 | `show PATH` | Publish an image and open the gallery if needed |
 | `show PATH --no-open` | Queue an image without opening a pane |
 | `show PATH --wait 10` | Wait up to 10 seconds for delivery status |
+| `show - --stdin-base64` | Publish one image from base64 on stdin |
+| `show - --format png` | Publish one image from raw bytes on stdin (format optional) |
+| `show - --stdin-json` | Publish many images from a JSON array or JSON Lines on stdin |
+| `show A.png B.png --title A --title B` | Publish several images, each with its own title/caption |
 | `browse DIR` | Browse all supported images in a directory |
 | `browse DIR --recursive` | Include subdirectories |
 | `browse DIR --no-open` | Queue a directory browse without opening a pane |
@@ -174,6 +178,27 @@ Without the skill, run `gallery.py` directly from the plugin directory. Locate t
 | `agent-status` | Report skill installation status for both agents |
 
 Publishing reuses the existing pane without changing keyboard focus. Native streams report `delivered: true` and `rendered: null`: submission does not independently confirm pixels on the host screen. `--wait` exits nonzero when delivery is not confirmed or decoding fails.
+
+### Send image bytes (no file)
+
+When the image exists only as bytes (base64 in an MCP tool result, the output of a remote renderer, a pipeline stage), publish it with `show -` instead of writing a file first:
+
+```sh
+# base64 on stdin
+base64 image.png | python3 gallery.py show - --stdin-base64 --title 'Axe small' --caption 'Top view'
+
+# raw bytes on stdin; the format comes from the magic bytes
+some-renderer --format png | python3 gallery.py show - --title 'Contact sheet'
+
+# many images in one call, each with its own title and caption
+jq -c '[.content[] | select(.type == "image")]' result.json | python3 gallery.py show - --stdin-json
+```
+
+`--stdin-json` reads a JSON array or JSON Lines; every entry carries `data` (base64) or `path`, plus optional `title`, `caption` and `format`/`mimeType`, so an MCP `image` content block can be piped through unchanged. Validation happens before anything is published: one bad entry names its index and publishes nothing.
+
+The bytes are copied into the gallery's own state directory under their sha256, so nothing is written into the calling directory and publishing the same image twice updates one history entry instead of adding another. `--format` (or a manifest `mimeType`) only declares the format: the content decides and a disagreement is a warning, not a failure. Anything that is not a supported image is refused, as is more than 64 MiB in one image or 256 MiB in one call. Both are reported as an error, never a silent truncation. Images are never fetched from URLs; pipe the bytes in yourself.
+
+For files, `--title` and `--caption` can also be repeated once per path (`show a.png b.png --title A --title B`); a single value still applies to every image.
 
 ## Open local image links
 
@@ -190,7 +215,9 @@ The gallery supports PNG, JPEG, WebP, GIF, TIFF, BMP, and HEIC through the macOS
 
 History and archived image copies are stored in `~/.local/state/herdr-image-gallery/`. Reopening in the same Herdr workspace restores history, selection, filter, and LIVE/HOLD state. History is separated by Herdr socket and workspace ID; a new workspace identity has its own history.
 
-Archived copies use disk space independently of the source files. Removing the plugin does not remove this history. `HERDR_GALLERY_STATE_DIR` overrides the storage directory.
+Archived copies use disk space independently of the source files. Images published from stdin live only in that archive, named `<sha256><extension>`, and history points straight at it. Removing the plugin does not remove this history. `HERDR_GALLERY_STATE_DIR` overrides the storage directory.
+
+A single image may be up to 64 MiB, whether it comes from a file or from stdin, and one stdin payload up to 256 MiB in total. Exceeding either is an error, not a truncated image.
 
 ## Troubleshooting
 
@@ -221,7 +248,7 @@ Run the tests from the repository root:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v
 ```
 
-Tests cover image history, decoding, preview replacement, loading indicators, agent setup, links, and terminal navigation. Visual behavior also needs checking in Herdr with a compatible outer terminal.
+Tests cover image history, decoding, preview replacement, loading indicators, agent setup, links, terminal navigation, and publishing from stdin (base64 and raw bytes, multi-image calls with per-image titles, sha256 dedup, size limits, magic-byte detection and rejection). Visual behavior also needs checking in Herdr with a compatible outer terminal.
 
 To report a problem, [open an issue](https://github.com/zbyhoo/herdr-image-gallery/issues) with your OS, Herdr, and terminal versions, reproduction steps, and any error shown in the gallery. Review diagnostic output and screenshots for private paths or image content before sharing them.
 

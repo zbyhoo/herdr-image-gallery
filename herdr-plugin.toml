@@ -1,6 +1,6 @@
 id = "local.image-gallery"
 name = "Image Gallery"
-version = "0.3.0"
+version = "1.0.0"
 min_herdr_version = "0.8.2"
 description = "Browse project and generated images inside a Herdr terminal pane"
 platforms = ["macos", "linux"]

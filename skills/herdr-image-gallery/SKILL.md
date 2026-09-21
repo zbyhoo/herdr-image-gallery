@@ -26,15 +26,26 @@ Use proper shell quoting for paths and text. Give every image its own title and 
 **Images you have as bytes, with no file:** pipe them into `show -`. Always through stdin, never in an argument: one argument is capped at 128 KiB, far below a real image. Replace `SCRIPT` with the helper path resolved as above.
 
 ```sh
-# base64 from an MCP tool result
-jq -r '.content[0].data' result.json | python3 SCRIPT show - --stdin-base64 --title 'Axe small' --caption 'Rotation, top view' --wait 10
-
 # raw bytes straight from a producer
 some-renderer --format png | python3 SCRIPT show - --title 'Contact sheet'
 
+# base64 you fetched yourself, so the bytes pass through your shell
+curl -fsS "$endpoint" | jq -r '.data' | python3 SCRIPT show - --stdin-base64 --title 'Axe small' --caption 'Rotation, top view' --wait 10
+
 # many images in ONE call, each with its own title and caption
-jq -c '[.content[] | select(.type == "image")]' result.json | python3 SCRIPT show - --stdin-json --wait 10
+printf '%s' "$entries" | python3 SCRIPT show - --stdin-json --wait 10
 ```
+
+**An image you can see is not an image you can pipe.** When a tool result reaches
+you as conversation content — an MCP `image` block, a rendered screenshot, a user
+attachment shown inline — those bytes live in the transcript, not on disk and not
+in any shell variable, and you cannot transcribe them: base64 of a real image is
+megabytes of text you do not hold as text. `--stdin-base64` and `--stdin-json`
+need bytes that a command of yours can actually emit. So publish what you
+produced or fetched: render it locally, `curl` it from an endpoint that serves
+it, read it off disk. If the only copy sits on a remote host you cannot reach,
+say that plainly and ask for what would give you the bytes; do not invent a path
+or claim the image was shown.
 
 `--stdin-json` takes a JSON array (or JSON Lines) of entries `{"data": "<base64>", "mimeType": "image/png", "title": "...", "caption": "..."}`; an MCP `image` content block passes through unchanged, and an entry may use `"path"` instead of `"data"` to mix files into the same call. A bad entry is named by index and nothing is published.
 

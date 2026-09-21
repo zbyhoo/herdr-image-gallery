@@ -191,8 +191,12 @@ base64 image.png | python3 gallery.py show - --stdin-base64 --title 'Axe small' 
 some-renderer --format png | python3 gallery.py show - --title 'Contact sheet'
 
 # many images in one call, each with its own title and caption
-jq -c '[.content[] | select(.type == "image")]' result.json | python3 gallery.py show - --stdin-json
+printf '%s' "$entries" | python3 gallery.py show - --stdin-json
 ```
+
+The bytes have to come from a command: a renderer, `curl`, a file on disk. An image that only
+exists as conversation content in an agent's transcript — an MCP `image` block, an inline
+attachment — cannot be piped in, because nothing on the command line holds those bytes.
 
 `--stdin-json` reads a JSON array or JSON Lines; every entry carries `data` (base64) or `path`, plus optional `title`, `caption` and `format`/`mimeType`, so an MCP `image` content block can be piped through unchanged. Validation happens before anything is published: one bad entry names its index and publishes nothing.
 

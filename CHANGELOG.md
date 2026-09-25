@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 - 2026-09-25
 
 ### Added
 - `show -` publishes an image from bytes on stdin, base64 (`--stdin-base64`) or raw, so an agent holding an image with no local file (for example base64 in an MCP tool result) can display it without writing one.
@@ -9,6 +9,9 @@
 - Image format is detected from magic bytes (PNG, JPEG, WebP, GIF, TIFF, BMP, HEIC); `--format` only declares it and content that is not a supported image is refused.
 - Bytes are archived under their sha256, so republishing the same image updates one history entry instead of adding another, and `status`/`list` report it exactly like a published file.
 - The `show` output lists every published image with its archive path, title, sha256, format and source.
+
+### Changed
+- The bundled skill no longer pins a Herdr version in its Kitty graphics setup note, so it stays correct across Herdr updates.
 
 ## 1.0.0 - 2026-09-20
 

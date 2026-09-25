@@ -12,6 +12,7 @@
 
 ### Changed
 - The bundled skill no longer pins a Herdr version in its Kitty graphics setup note, so it stays correct across Herdr updates.
+- Guidance for developing the plugin moved from the bundled skill to `AGENTS.md`, so agents that only display images no longer load it.
 
 ## 1.0.0 - 2026-09-20
 

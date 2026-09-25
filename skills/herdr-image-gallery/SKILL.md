@@ -53,7 +53,7 @@ The bytes are copied into the gallery's own state directory under a sha256 name,
 
 `show` opens the registered plugin pane to the RIGHT when needed and otherwise updates it without changing keyboard focus. Preserve the user's chosen layout; do not force the gallery below the conversation. It routes by the caller's Herdr socket and workspace, so never override those to target a different project.
 
-The user owns the gallery's position and size after it opens. Never move, swap, resize, close/recreate or refocus an existing gallery as part of displaying images, debugging or updating the plugin. A right split is only the default for the FIRST opening or after the user has closed the gallery. Code updates reload in the same terminal process and pane; preserve any location the user chose, including placement above/below other right-column tools. Only an explicit user request to rearrange the gallery authorizes layout changes.
+The user owns the gallery's position and size after it opens. Never move, swap, resize, close/recreate or refocus an existing gallery as part of displaying images or debugging. A right split is only the default for the FIRST opening or after the user has closed the gallery. Only an explicit user request to rearrange the gallery authorizes layout changes.
 
 Native Herdr streams report `delivered: true`, `rendered: null`, and `acknowledgement: "herdr-stream-submitted"`; this confirms submission, not host pixels. Do not claim visual verification from that result. For the raw terminal fallback, `rendered: true` means Herdr's pane terminal acknowledged the decoded graphics commands, not independently verified host pixels. A nonzero exit means delivery/rendering was not confirmed; inspect `gallery.py status` and report the actual error. A HOLD viewer intentionally delays requests until the user presses `a`; do not override their choice. Local Herdr/socket/state access may require the normal sandbox escalation; do not bypass it.
 
@@ -65,7 +65,7 @@ Self-service opening: `herdr plugin action invoke local.image-gallery.open`. Con
 
 When the user asks to see the images in a folder, run `scripts/gallery.py browse '/absolute/path/to/dir'` (add `--recursive` for subfolders). This lists every supported image in that directory in the gallery pane; it does not publish them into history. Directory scans run in the background so the pane stays responsive; the footer shows `scanning...` while a new directory is first read, and `2000+ images, limited` when a huge tree (e.g. `~` or `/`) is capped. Use `show` for individual generated or attached files.
 
-Escape must never close the gallery: it ends filter editing, cancels the directory prompt, or returns to thumbnails. Only q closes it. Preserve this explicit user preference when changing navigation.
+Escape does not close the gallery: it ends filter editing, cancels the directory prompt, or returns to thumbnails. Only q closes it.
 
 The gallery does not provide an image-generation service. Use the agent's available tools to create images; publish any resulting local files. The shared gallery is scoped to the Herdr workspace, not to one agent, so Codex and Claude Code can contribute to the same history. If another agent publishes a new image, LIVE follows it; HOLD preserves the user's selection.
 

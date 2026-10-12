@@ -72,6 +72,8 @@ The plugin links the skill to its installed checkout. It preserves conflicting f
 
 For **Claude Code**, ask it to show an image, or invoke `/herdr-image-gallery`. For **Codex**, restart it if the skill is not loaded, then ask it to use `$herdr-image-gallery`. If Claude does not list the newly registered skill, restart Claude as well. Both agents must run inside the intended Herdr workspace. An already running agent may need to load the skill before automatic use begins.
 
+The gallery follows the agent's pane: `show` opens it to the right of the pane the agent runs in, in that pane's workspace, unless that workspace already has a gallery, which is reused wherever you put it. Before choosing, the helper checks the pane with Herdr, because the inherited `HERDR_*` variables can be stale: a pane moved to another workspace gets a new ID, and Codex runs every session's commands in one shared app-server that carries the pane of whichever session started it. For Codex it finds the session's own pane by working directory and, when several Codex panes share a project, by the thread name in the terminal title. If it still cannot tell them apart, it keeps the inherited pane and says so on stderr and in the `pane_resolution` field of its output.
+
 Example prompt for either agent:
 
 > Show each image you create or review using the herdr-image-gallery skill. Preserve the gallery's pane position.
@@ -168,7 +170,7 @@ Without the skill, run `gallery.py` directly from the plugin directory. Locate t
 | `browse DIR` | Browse all supported images in a directory |
 | `browse DIR --recursive` | Include subdirectories |
 | `browse DIR --no-open` | Queue a directory browse without opening a pane |
-| `open` | Open or reuse the gallery |
+| `open` | Open the gallery to the right of the calling pane, or reuse it |
 | `list` | Print image history as JSON |
 | `status` | Print viewer state and diagnostics as JSON |
 | `setup-agents --agent both --yes` | Register the skill for both agents |
@@ -230,6 +232,8 @@ A single image may be up to 64 MiB, whether it comes from a file or from stdin, 
 **Images disappear while PREFIX mode is active.** Herdr 0.8.2 hides graphics in PREFIX mode. Leave that mode with Esc to restore them. This is a Herdr renderer limitation that the plugin cannot fix.
 
 **An agent does not send images.** Press `s` in the gallery or run `gallery.py agent-status`. Verify the relevant skill is registered in the agent's configuration directory. Ask Claude Code to invoke `/herdr-image-gallery`, or restart Codex and load the skill. Restart Claude if it does not discover a new skill. Keep the agent inside the target Herdr workspace.
+
+**The gallery opens in another workspace.** Check the `workspace`, `pane` and `pane_resolution` fields printed by `show`. With Codex, `ambiguous` means several Codex panes share the project directory and the session's thread name is not in exactly one of their terminal titles, for example before Codex has named a new thread. Agents should open the gallery with `gallery.py open` rather than `herdr plugin action invoke`, which carries no caller pane.
 
 **Skill setup reports an existing destination.** Inspect the reported path. If it is an obsolete symlink from an earlier installation, remove that link and retry setup. Preserve any files you still need.
 

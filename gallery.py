@@ -505,6 +505,109 @@ def link_path(url):
     return image_path(path)
 
 
+def codex_daemon_caller():
+    """True when a shared Codex app-server runs this command; None when processes cannot be listed.
+
+    One app-server serves every Codex session and keeps the HERDR_* of the pane that started it, so
+    the inherited pane belongs to that session, not necessarily to the one asking.
+    """
+    try:
+        listing = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,args="], capture_output=True,
+                                 text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listing.returncode:
+        return None
+    table = listing.stdout
+    processes = {}
+    for row in table.splitlines():
+        fields = row.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            processes[int(fields[0])] = (int(fields[1]), fields[2].split() if len(fields) > 2 else [])
+    pid, seen = os.getppid(), set()
+    while pid in processes and pid not in seen:
+        seen.add(pid)
+        pid, argv = processes[pid]
+        if argv[:1] and Path(argv[0]).name.startswith("codex") and argv[1:2] == ["app-server"]:
+            return True
+    return False
+
+
+def codex_thread_name(thread):
+    index = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "session_index.jsonl"
+    name = ""
+    try:
+        with index.open(encoding="utf-8") as handle:
+            for line in handle:
+                if thread not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("id") == thread and entry.get("thread_name"):
+                    name = entry["thread_name"]  # later lines record renames
+    except OSError:
+        pass
+    return name
+
+
+def codex_session_panes(thread):
+    """Codex panes that may host `thread`: deepest working directory containing ours, then thread name."""
+    panes = [pane for pane in herdr("pane", "list")["result"]["panes"] if pane.get("agent") == "codex"]
+    cwd = os.path.realpath(os.getcwd())
+
+    def depth(pane):
+        roots = {os.path.realpath(d) for d in (pane.get("foreground_cwd"), pane.get("cwd")) if d}
+        return max((len(root) for root in roots
+                    if cwd == root or cwd.startswith(root.rstrip(os.sep) + os.sep)), default=-1)
+
+    deepest = max(map(depth, panes), default=-1)
+    located = [pane for pane in panes if deepest >= 0 and depth(pane) == deepest]
+    name = codex_thread_name(thread)
+    titled = [pane for pane in (located or panes)
+              if name and name in (pane.get("terminal_title_stripped") or pane.get("terminal_title") or "")]
+    return titled or located
+
+
+def resolve_caller():
+    """Point HERDR_PANE/TAB/WORKSPACE_ID at the pane this command really runs for.
+
+    Inherited IDs can be stale: a pane moved to another workspace gets a new ID while its process
+    keeps the old one, and Codex's shared app-server carries another session's pane. History and
+    placement both follow these variables, so they are corrected before connect(). Lookup failures
+    keep the inherited values, as before; an ambiguous Codex lookup is reported, never guessed.
+    """
+    inherited = os.environ.get("HERDR_PANE_ID")
+    if not inherited:
+        return None
+    try:
+        thread = os.environ.get("CODEX_THREAD_ID")
+        shared = codex_daemon_caller() if thread else False
+        if shared is None:
+            print("Image Gallery: cannot list processes to check for a shared Codex app-server; "
+                  "the gallery follows the inherited pane %s." % inherited, file=sys.stderr)
+        if shared:
+            panes = codex_session_panes(thread)
+            if len(panes) != 1:
+                print("Image Gallery: cannot tell which Herdr pane runs this Codex session (%s); using "
+                      "the inherited %s." % (", ".join(p["pane_id"] for p in panes) or "no match", inherited),
+                      file=sys.stderr)
+                return {"status": "ambiguous" if panes else "unresolved", "pane": inherited,
+                        "candidates": [pane["pane_id"] for pane in panes]}
+            pane = panes[0]
+        else:
+            pane = herdr("pane", "get", inherited)["result"]["pane"]
+        actual = {"HERDR_PANE_ID": pane["pane_id"], "HERDR_WORKSPACE_ID": pane["workspace_id"],
+                  "HERDR_TAB_ID": pane.get("tab_id") or os.environ.get("HERDR_TAB_ID", "")}
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError):
+        return None
+    if actual["HERDR_PANE_ID"] == inherited and actual["HERDR_WORKSPACE_ID"] == os.environ.get("HERDR_WORKSPACE_ID"):
+        return None
+    os.environ.update(actual)
+    return {"status": "resolved", "pane": actual["HERDR_PANE_ID"], "inherited_pane": inherited}
+
+
 def open_pane(db):
     if time.time() - float(get(db, "heartbeat", "0")) < 4:
         return {"existing_pane": get(db, "pane")}
@@ -1353,6 +1456,11 @@ def main():
         url = os.environ.get("HERDR_PLUGIN_CLICKED_URL") or context.get("clicked_url", "")
         args.paths = [str(link_path(url))]
         args.command = "show"
+    # The viewer runs in its own plugin pane, whose context Herdr sets directly.
+    resolution = resolve_caller() if args.command != "view" or args.open_action else None
+    routing = {"workspace": os.environ.get("HERDR_WORKSPACE_ID"), "pane": os.environ.get("HERDR_PANE_ID")}
+    if resolution:
+        routing["pane_resolution"] = resolution
     db = connect()
     try:
         if args.open_action or args.command == "open":
@@ -1372,7 +1480,7 @@ def main():
                               "images": [{key: item[key] for key in ("path", "title", "sha256", "format", "source")}
                                          for item in published], "rendered": None if get(db, "acknowledgement") == "herdr-stream-submitted" else rendered and not error,
                               "delivered": rendered and not error, "acknowledgement": get(db, "acknowledgement", "kitty-terminal"),
-                              "error": error, "workspace": os.environ["HERDR_WORKSPACE_ID"]}))
+                              "error": error, **routing}))
             if args.wait and (not rendered or get(db, "error")):
                 return 2
         elif args.command == "browse":
@@ -1387,8 +1495,7 @@ def main():
             if not args.no_open:
                 open_pane(db)
             print(json.dumps({"browse_request": token, "directory": str(directory),
-                              "recursive": bool(args.recursive),
-                              "workspace": os.environ["HERDR_WORKSPACE_ID"]}))
+                              "recursive": bool(args.recursive), **routing}))
         elif args.command == "list":
             print(json.dumps([dict(r) for r in db.execute("SELECT * FROM images ORDER BY id")]))
         elif args.command == "status":

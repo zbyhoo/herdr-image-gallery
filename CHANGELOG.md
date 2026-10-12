@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- The gallery opens to the right of the agent's own pane, in its workspace, even when the inherited `HERDR_*` variables name another pane. Codex runs every session's commands in one shared app-server that carries the pane of whichever session started it, so images from one project landed in another workspace's gallery; the helper now finds the session's Codex pane by working directory and thread name. A pane moved to another workspace is followed to its new ID. `show` and `browse` report the `pane` they used and, when the inherited one was corrected or could not be, a `pane_resolution` field.
+- The skill opens the gallery with `gallery.py open` instead of `herdr plugin action invoke`, which carries no caller pane.
+
 ## 1.1.0 - 2026-09-25
 
 ### Added

@@ -392,6 +392,121 @@ class GalleryTests(unittest.TestCase):
                 gallery.open_pane(self.db)
             cli.assert_called_once_with("pane", "get", "w1:p7")
 
+    @staticmethod
+    def pane(pane_id, cwd, title="", agent="codex"):
+        workspace = pane_id.split(":")[0]
+        return {"pane_id": pane_id, "workspace_id": workspace, "tab_id": workspace + ":t1", "agent": agent,
+                "cwd": cwd, "foreground_cwd": cwd, "terminal_title_stripped": title}
+
+    def caller_env(self, **values):
+        env = {"HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "w1:t1", "HERDR_WORKSPACE_ID": "w1", "CODEX_THREAD_ID": ""}
+        env.update(values)
+        return patch.dict(os.environ, env)
+
+    def test_caller_pane_without_herdr_context_is_not_looked_up(self):
+        with patch.object(gallery, "herdr") as cli:
+            self.assertIsNone(gallery.resolve_caller())
+        cli.assert_not_called()
+
+    def test_caller_in_its_original_pane_keeps_inherited_context(self):
+        reply = {"result": {"pane": self.pane("w1:p1", self.temp.name, agent="claude")}}
+        with self.caller_env(), patch.object(gallery, "herdr", return_value=reply) as cli:
+            self.assertIsNone(gallery.resolve_caller())
+            self.assertEqual(os.environ["HERDR_WORKSPACE_ID"], "w1")
+        cli.assert_called_once_with("pane", "get", "w1:p1")
+
+    def test_moved_caller_pane_routes_history_to_its_new_workspace(self):
+        reply = {"result": {"pane": self.pane("w2:p4", self.temp.name, agent="claude")}}
+        with self.caller_env(), patch.object(gallery, "herdr", return_value=reply):
+            self.assertEqual(gallery.resolve_caller(),
+                             {"status": "resolved", "pane": "w2:p4", "inherited_pane": "w1:p1"})
+            self.assertEqual((os.environ["HERDR_PANE_ID"], os.environ["HERDR_TAB_ID"],
+                              os.environ["HERDR_WORKSPACE_ID"]), ("w2:p4", "w2:t1", "w2"))
+            moved = gallery.connect()
+            self.addCleanup(moved.close)
+            gallery.publish(moved, self.path)
+        self.assertEqual(gallery.get(self.db, "request"), "")
+
+    def test_shared_codex_server_routes_to_the_session_pane_by_directory(self):
+        project = Path(self.temp.name) / "neon"
+        (project / "src").mkdir(parents=True)
+        panes = [self.pane("w1:p1", self.temp.name + "/other"), self.pane("w3:p1", str(project)),
+                 self.pane("w4:p1", str(project), agent="claude"), self.pane("w5:p1", self.temp.name)]
+        with self.caller_env(CODEX_THREAD_ID="thread-a"), patch.object(gallery, "codex_daemon_caller", return_value=True), \
+             patch.object(gallery, "herdr", return_value={"result": {"panes": panes}}) as cli, \
+             patch.object(os, "getcwd", return_value=str(project / "src")):
+            self.assertEqual(gallery.resolve_caller()["pane"], "w3:p1")
+            self.assertEqual(os.environ["HERDR_WORKSPACE_ID"], "w3")
+        cli.assert_called_once_with("pane", "list")
+
+    def test_shared_codex_server_separates_sessions_in_one_project_by_thread_name(self):
+        codex_home = Path(os.environ["CODEX_HOME"])
+        codex_home.mkdir()
+        (codex_home / "session_index.jsonl").write_text(
+            '{"id":"thread-a","thread_name":"Old name"}\nnot json thread-a\n'
+            '{"id":"thread-b","thread_name":"Review weapon effects"}\n'
+            '{"id":"thread-a","thread_name":"Design the chests"}\n')
+        panes = [self.pane("w1:p1", self.temp.name, "Review weapon effects | neon"),
+                 self.pane("w3:p1", self.temp.name, "⠸ Design the chests | neon")]
+        with self.caller_env(CODEX_THREAD_ID="thread-a"), patch.object(gallery, "codex_daemon_caller", return_value=True), \
+             patch.object(gallery, "herdr", return_value={"result": {"panes": panes}}), \
+             patch.object(os, "getcwd", return_value=self.temp.name):
+            self.assertEqual(gallery.resolve_caller()["pane"], "w3:p1")
+
+    def test_ambiguous_codex_session_keeps_inherited_pane_and_says_so(self):
+        panes = [self.pane("w3:p1", self.temp.name, "A | neon"), self.pane("w4:p1", self.temp.name, "B | neon")]
+        err = io.StringIO()
+        with self.caller_env(CODEX_THREAD_ID="thread-a"), patch.object(gallery, "codex_daemon_caller", return_value=True), \
+             patch.object(gallery, "herdr", return_value={"result": {"panes": panes}}), \
+             patch.object(os, "getcwd", return_value=self.temp.name), patch("sys.stderr", new=err):
+            self.assertEqual(gallery.resolve_caller(),
+                             {"status": "ambiguous", "pane": "w1:p1", "candidates": ["w3:p1", "w4:p1"]})
+            self.assertEqual(os.environ["HERDR_PANE_ID"], "w1:p1")
+        self.assertIn("w3:p1, w4:p1", err.getvalue())
+
+    def test_unlistable_processes_are_reported_and_fall_back_to_the_pane_lookup(self):
+        reply = {"result": {"pane": self.pane("w1:p1", self.temp.name)}}
+        err = io.StringIO()
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="ps: permission denied")
+        with self.caller_env(CODEX_THREAD_ID="thread-a"), patch.object(gallery.subprocess, "run", return_value=failed), \
+             patch.object(gallery, "herdr", return_value=reply) as cli, patch("sys.stderr", new=err):
+            self.assertIsNone(gallery.resolve_caller())
+        cli.assert_called_once_with("pane", "get", "w1:p1")
+        self.assertIn("cannot list processes", err.getvalue())
+
+    def test_caller_lookup_failure_keeps_inherited_context(self):
+        for thread in ("", "thread-a"):
+            with self.caller_env(CODEX_THREAD_ID=thread), patch.object(gallery, "codex_daemon_caller", return_value=True), \
+                 patch.object(gallery, "herdr", side_effect=RuntimeError("Permission denied")):
+                self.assertIsNone(gallery.resolve_caller())
+                self.assertEqual(os.environ["HERDR_PANE_ID"], "w1:p1")
+
+    def test_daemon_detection_follows_process_ancestry(self):
+        table = ("  10     1 /usr/bin/codex app-server --listen unix:// --managed-daemon\n"
+                 "  20    10 /bin/bash -lc python3 gallery.py show x.png\n"
+                 "  30     1 /usr/bin/claude\n  40    30 /bin/bash -c python3 gallery.py show x.png\n"
+                 "  50     1 /usr/bin/node app-server\n  60    50 bash\n")
+        result = subprocess.CompletedProcess([], 0, stdout=table)
+        with patch.object(gallery.subprocess, "run", return_value=result):
+            for parent, expected in ((20, True), (40, False), (60, False)):
+                with patch.object(os, "getppid", return_value=parent):
+                    self.assertEqual(gallery.codex_daemon_caller(), expected)
+
+    def test_show_publishes_into_the_resolved_workspace(self):
+        reply = {"result": {"pane": self.pane("w2:p4", self.temp.name, agent="claude")}}
+        out = io.StringIO()
+        argv = [gallery.__file__, "show", str(self.path), "--no-open"]
+        with self.caller_env(), patch.object(gallery, "herdr", return_value=reply), \
+             patch.object(sys, "argv", argv), patch("sys.stdout", new=out):
+            self.assertEqual(gallery.main(), 0)
+            moved = gallery.connect()
+            self.addCleanup(moved.close)
+            self.assertEqual(gallery.get(moved, "requested_path"), str(self.path.resolve()))
+        result = json.loads(out.getvalue())
+        self.assertEqual((result["workspace"], result["pane"], result["pane_resolution"]["inherited_pane"]),
+                         ("w2", "w2:p4", "w1:p1"))
+        self.assertEqual(gallery.get(self.db, "request"), "")
+
     def test_image_survives_original_deletion_and_reconnection(self):
         gallery.publish(self.db, self.path, "Keep me")
         self.path.unlink()
@@ -1216,7 +1331,7 @@ class StdinPublishTests(unittest.TestCase):
         self.assertEqual([(row["title"], row["caption"]) for row in self.rows()], [("A", "ca"), ("B", "cb")])
         # Legacy shape: one --title/--caption still applies to every path, and no key was dropped.
         self.assertEqual(set(payload) - {"images"},
-                         {"request", "path", "rendered", "delivered", "acknowledgement", "error", "workspace"})
+                         {"request", "path", "rendered", "delivered", "acknowledgement", "error", "workspace", "pane"})
         self.db.execute("DELETE FROM images")
         self.db.commit()
         self.cli(["show", str(first), str(second), "--title", "Both", "--no-open"])

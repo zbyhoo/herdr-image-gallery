@@ -555,6 +555,8 @@ class GalleryTests(unittest.TestCase):
     def test_local_image_links_decode_spaces_and_reject_network_paths(self):
         self.assertEqual(gallery.link_path(self.path.as_uri()), self.path.resolve())
         self.assertEqual(gallery.link_path("herdr-image://open?path=" + quote(str(self.path))), self.path.resolve())
+        with patch.object(gallery.socket, "gethostname", return_value="Studio.local"):
+            self.assertEqual(gallery.link_path("file://studio.LOCAL" + quote(str(self.path))), self.path.resolve())
         for url in ("https://example.com/image.png", "file://server/share/image.png", "herdr-image://open?path=relative.png"):
             with self.assertRaises(ValueError):
                 gallery.link_path(url)

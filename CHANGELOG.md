@@ -6,6 +6,7 @@
 - The gallery opens to the right of the agent's own pane, in its workspace, even when the inherited `HERDR_*` variables name another pane. Codex runs every session's commands in one shared app-server that carries the pane of whichever session started it, so images from one project landed in another workspace's gallery; the helper now finds the session's Codex pane by working directory and thread name. A pane moved to another workspace is followed to its new ID. `show` and `browse` report the `pane` they used and, when the inherited one was corrected or could not be, a `pane_resolution` field.
 - The skill opens the gallery with `gallery.py open` instead of `herdr plugin action invoke`, which carries no caller pane.
 - Images display again on Herdr 0.9.4 and later, which removed the `pane.graphics.*` socket API: the gallery falls back to standard Kitty graphics output, and `show --wait` reports delivery from the terminal's reply. Older Herdr versions keep the native path.
+- Ctrl-clicking a `file://` image link that names this machine's hostname (as `ls --hyperlink` writes it) opens the image instead of being rejected as a network path.
 
 ## 1.1.0 - 2026-09-25
 

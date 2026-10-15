@@ -210,7 +210,7 @@ For files, `--title` and `--caption` can also be repeated once per path (`show a
 
 Ctrl-click a hyperlink in either of these forms inside Herdr:
 
-- `file:///absolute/path/to/image.png`
+- `file:///absolute/path/to/image.png`, or `file://<this machine's hostname>/absolute/path/to/image.png` as written by `ls --hyperlink`
 - `herdr-image://open?path=<URL-encoded absolute image path>`
 
 Use **Control** on macOS too. The terminal must recognize the text as a hyperlink. HTTP images are not downloaded, and plain unlinked paths do not invoke the handler.

@@ -494,7 +494,8 @@ def publish(db, path, title="", caption=""):
 
 def link_path(url):
     parsed = urlsplit(url)
-    if parsed.scheme == "file" and parsed.netloc in ("", "localhost"):
+    # `ls --hyperlink` and Kitty-style emitters name the local host explicitly.
+    if parsed.scheme == "file" and parsed.netloc.lower() in ("", "localhost", socket.gethostname().lower()):
         path = unquote(parsed.path)
     elif parsed.scheme == "herdr-image" and parsed.netloc == "open":
         path = parse_qs(parsed.query).get("path", [""])[0]

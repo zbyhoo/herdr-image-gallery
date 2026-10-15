@@ -716,9 +716,16 @@ def graphics_api(method, **params):
 
 NATIVE_LAYERS = set()
 NATIVE_STREAMS = {}
+# Herdr 0.9.4 removed pane.graphics.*; its panes render standard Kitty graphics instead.
+NATIVE_SUPPORTED = True
+
+
+class NativeGraphicsUnavailable(RuntimeError):
+    pass
 
 
 def native_frame(layer_id, data, **header):
+    global NATIVE_SUPPORTED
     if layer_id not in NATIVE_STREAMS:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(5)
@@ -730,6 +737,9 @@ def native_frame(layer_id, data, **header):
             reader = client.makefile("rb")
             response = json.loads(reader.readline(1024 * 1024))
             if "error" in response:
+                if isinstance(response["error"], dict) and response["error"].get("code") == "unknown_method":
+                    NATIVE_SUPPORTED = False
+                    raise NativeGraphicsUnavailable(str(response["error"]))
                 raise RuntimeError(str(response["error"]))
             NATIVE_STREAMS[layer_id] = (client, reader)
         except Exception:
@@ -752,7 +762,7 @@ def native_frame(layer_id, data, **header):
 
 
 def native_graphics():
-    return bool(os.environ.get("HERDR_PANE_ID"))
+    return NATIVE_SUPPORTED and bool(os.environ.get("HERDR_PANE_ID"))
 
 
 def transmit(encoded, width, height, columns, rows, image_id=IMAGE_ID, col=0, row=0):
@@ -760,10 +770,13 @@ def transmit(encoded, width, height, columns, rows, image_id=IMAGE_ID, col=0, ro
         layer = "image-gallery-" + str(image_id)
         # Register before sending so cleanup can recover a timed-out acknowledgement.
         NATIVE_LAYERS.add(layer)
-        native_frame(layer, zlib.decompress(base64.b64decode(encoded)),
-                     format="rgb", image_width=width, image_height=height,
-                     placement={"viewport_col": col, "viewport_row": row, "grid_cols": columns, "grid_rows": rows})
-        return
+        try:
+            native_frame(layer, zlib.decompress(base64.b64decode(encoded)),
+                         format="rgb", image_width=width, image_height=height,
+                         placement={"viewport_col": col, "viewport_row": row, "grid_cols": columns, "grid_rows": rows})
+            return
+        except NativeGraphicsUnavailable:
+            NATIVE_LAYERS.discard(layer)
     chunks = [encoded[i:i + 4096] for i in range(0, len(encoded), 4096)]
     for i, chunk in enumerate(chunks):
         header = ("a=T,f=24,o=z,s=%d,v=%d,t=d,i=%d,c=%d,r=%d,q=%d,C=1," % (width, height, image_id, columns, rows, 0 if image_id == IMAGE_ID else 2)) if i == 0 else ""
@@ -805,9 +818,13 @@ def loading_indicator(cols, rows, tick):
                 pixels[offset:offset + 4] = bytes((125, 225, 215, alpha))
     layer = "image-gallery-loading"
     NATIVE_LAYERS.add(layer)
-    native_frame(layer, bytes(pixels), format="rgba", image_width=size, image_height=size,
-                 placement={"viewport_col": max(0, cols // 2 - 2), "viewport_row": max(0, rows // 2 - 1),
-                            "grid_cols": 4, "grid_rows": 2})
+    try:
+        native_frame(layer, bytes(pixels), format="rgba", image_width=size, image_height=size,
+                     placement={"viewport_col": max(0, cols // 2 - 2), "viewport_row": max(0, rows // 2 - 1),
+                                "grid_cols": 4, "grid_rows": 2})
+    except NativeGraphicsUnavailable:
+        NATIVE_LAYERS.discard(layer)
+        loading_indicator(cols, rows, tick)
 
 
 def prepare_preview(item, cols, rows, cw, ch):
@@ -1114,6 +1131,8 @@ def gallery(db):
     signal.signal(signal.SIGINT, stop)
     sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
     sys.stdout.flush()
+    # Drop a stale native acknowledgement; draws re-set it while native graphics work.
+    put(db, acknowledgement="kitty-terminal")
     tty.setraw(fd)
     try:
         while running:
@@ -1123,7 +1142,7 @@ def gallery(db):
                     break
                 heartbeat = time.time()
                 put(db, heartbeat=heartbeat, pane=os.environ.get("HERDR_PANE_ID", ""))
-            if native_graphics() and time.monotonic() - label_checked > 5:
+            if os.environ.get("HERDR_PANE_ID") and time.monotonic() - label_checked > 5:
                 label_checked = time.monotonic()
                 label = workspace_label(cache.get("workspace_label"))
                 if label != cache.get("workspace_label"):

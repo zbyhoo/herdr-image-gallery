@@ -16,7 +16,7 @@ import time
 import zlib
 from urllib.parse import quote
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import gallery
 
@@ -271,6 +271,25 @@ class GalleryTests(unittest.TestCase):
             self.assertEqual(clear.call_args.args, ("clear",))
             self.assertEqual(clear.call_args.kwargs, {"layer_id": "image-gallery-71031"})
             self.assertFalse(gallery.NATIVE_LAYERS)
+
+    def test_removed_native_api_falls_back_to_kitty_output(self):
+        encoded = base64.b64encode(zlib.compress(b"\xff\0\0"))
+        reply = b'{"id":"gallery-stream","error":{"code":"unknown_method","message":"unknown method: pane.graphics.stream"}}\n'
+        server = MagicMock()
+        server.makefile.return_value = io.BytesIO(reply)
+        out = io.TextIOWrapper(io.BytesIO())
+        with patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p2", "HERDR_SOCKET_PATH": "/tmp/herdr.sock"}), \
+             patch.object(gallery, "NATIVE_SUPPORTED", True), patch.object(gallery, "NATIVE_LAYERS", set()), \
+             patch.object(gallery.socket, "socket", return_value=server), patch("sys.stdout", new=out):
+            gallery.transmit(encoded, 1, 1, 10, 5, col=8, row=4)
+            self.assertFalse(gallery.native_graphics())
+            self.assertFalse(gallery.NATIVE_LAYERS)
+            gallery.loading_indicator(80, 24, 0)
+            out.flush()
+            written = out.buffer.getvalue()
+        self.assertEqual(server.connect.call_count, 1)
+        self.assertIn(b"\x1b_Ga=T,f=24,o=z,s=1,v=1,", written)
+        self.assertIn(b"Loading", written)
 
     def test_resize_refresh_debounces_and_stops_after_two_replays(self):
         refresh = gallery.ResizeRefresh()
